@@ -5372,6 +5372,19 @@ def _static_models_catalog_without_live_probes() -> dict:
                 )
             detected_providers.add(provider_slug)
 
+            # Preserve the operator-supplied label from config
+            # (custom_providers[].models[].label). Falling back to
+            # _get_label_for_model() title-cases the raw id and mangles
+            # namespaced Bedrock ids like "us.anthropic.claude-opus-4-8" into
+            # "Us.anthropic.claude Opus 4 8". Build a label map from the config
+            # options so a clean label such as "Claude Opus 4.8" survives.
+            _label_map: dict[str, str] = {}
+            for _opt in _configured_model_options(entry.get("models")):
+                _oid = str(_opt.get("id") or "").strip()
+                _olabel = str(_opt.get("label") or "").strip()
+                if _oid and _olabel:
+                    _label_map[_oid] = _olabel
+
             configured_ids: list[str] = []
             model_id = str(entry.get("model") or "").strip()
             if model_id:
@@ -5381,7 +5394,7 @@ def _static_models_catalog_without_live_probes() -> dict:
                     configured_ids.append(configured_id)
 
             for configured_id in configured_ids:
-                label = _get_label_for_model(configured_id, [])
+                label = _label_map.get(configured_id) or _get_label_for_model(configured_id, [])
                 if provider_slug == "custom":
                     custom_group_models.append({"id": configured_id, "label": label})
                 else:
@@ -7304,6 +7317,18 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             {"id": _cp_option_id, "label": _live_model.get("label") or _get_label_for_model(_live_id, [])}
                         )
 
+                # Config label map: honor operator-supplied labels
+                # (custom_providers[].models[].label) instead of title-casing
+                # the raw id, which mangles namespaced Bedrock ids like
+                # "us.anthropic.claude-opus-4-8" -> "Us.anthropic.claude Opus 4 8"
+                # (and ".../-v1:0" -> "0"). Mirrors the cold-path fix at ~5304.
+                _cp_label_map: dict = {}
+                for _opt in _configured_model_options(_cp.get("models")):
+                    _oid = str(_opt.get("id") or "").strip()
+                    _olabel = str(_opt.get("label") or "").strip()
+                    if _oid and _olabel:
+                        _cp_label_map[_oid] = _olabel
+
                 # Collect configured model IDs as a fallback/sticky entry after live discovery.
                 _cp_model_ids: list[str] = []
                 _cp_model = _cp.get("model", "")
@@ -7316,7 +7341,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 for _cp_model in _cp_model_ids:
                     _dedup_key = f"{_slug}:{_cp_model}" if _slug else _cp_model
                     if _cp_model and _dedup_key not in _seen_custom_ids:
-                        _cp_label = _get_label_for_model(_cp_model, [])
+                        _cp_label = _cp_label_map.get(_cp_model) or _get_label_for_model(_cp_model, [])
                         _seen_custom_ids.add(_dedup_key)
                         if _slug:
                             detected_providers.add(_slug)
