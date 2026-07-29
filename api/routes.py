@@ -11004,6 +11004,26 @@ def _handle_llm_wiki_status(handler, parsed) -> bool:
     return True
 
 
+def _serve_insights_page(handler, parsed) -> bool:
+    """Serve the static insights HTML page (no auth — data via AJAX)."""
+    import pathlib
+    here = pathlib.Path(__file__).resolve().parent.parent
+    html_path = here / "webui_extension" / "insights.html"
+    if not html_path.is_file():
+        handler.send_response(404)
+        handler.end_headers()
+        handler.wfile.write(b"insights.html not found")
+        return True
+    body = html_path.read_bytes()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    handler.wfile.write(body)
+    return True
+
+
 def _handle_insights(handler, parsed) -> bool:
     """Return usage analytics from local WebUI session data."""
     import collections
@@ -12442,6 +12462,10 @@ def handle_get(handler, parsed) -> bool:
             handler.send_response(204)
             handler.end_headers()
         return True
+
+    # ── Insights page (static HTML, data comes via /api/insights) ──
+    if parsed.path == "/insights":
+        return _serve_insights_page(handler, parsed)
 
     if parsed.path.startswith("/api/") and not _guard_request_session_visibility(handler, parsed, method="GET"):
         return True
