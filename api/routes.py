@@ -2389,7 +2389,13 @@ def _build_session_list_cache_payload(
                 if s.get("session_id") != meta.get("session_id"):
                     s["session_id"] = meta.get("session_id")
             else:
-                for key in ("source_tag", "raw_source", "session_source", "source_label"):
+                for key in (
+                    "source_tag",
+                    "raw_source",
+                    "session_source",
+                    "source_label",
+                    "project_id",
+                ):
                     if not s.get(key) and meta.get(key):
                         s[key] = meta[key]
         webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
@@ -9430,6 +9436,7 @@ def _dedupe_cli_sidebar_sessions_for_api(
         _hide_from_default_sidebar as _hide_background,
         _include_project_hidden_background_sidebar_sessions,
     )
+    from api.agent_sessions import is_project_assigned_cli_session_row_visible
 
     # An explicit background source filter reveals that source (override the hide).
     # Normalize to match how the loader canonicalizes source_filter (strip+lower).
@@ -9445,7 +9452,10 @@ def _dedupe_cli_sidebar_sessions_for_api(
         s for s in cli
         if s["session_id"] not in represented_webui_ids
         and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
-        and is_cli_session_row_visible(s)
+        and (
+            is_cli_session_row_visible(s)
+            or is_project_assigned_cli_session_row_visible(s)
+        )
     ]
     visible = [
         s for s in candidates
@@ -12448,6 +12458,14 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/project-os/dashboard":
         return _handle_project_os_dashboard(handler, parsed)
 
+    if parsed.path.startswith("/api/fork-keeper/"):
+        from api.fork_keeper_bridge import handle_fork_keeper_get
+
+        # Same False/None protocol as the kanban bridge: False means no
+        # route matched; None means the bridge already answered.
+        if handle_fork_keeper_get(handler, parsed) is False:
+            return False
+        return True
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_get
 
@@ -14335,6 +14353,12 @@ def handle_post(handler, parsed) -> bool:
         result = repair_safe_session_recovery(SESSION_DIR, state_db_path=_active_state_db_path())
         return j(handler, result, status=200 if result.get("clean") else 409)
 
+    if parsed.path.startswith("/api/fork-keeper/"):
+        from api.fork_keeper_bridge import handle_fork_keeper_post
+
+        if handle_fork_keeper_post(handler, parsed, body) is False:
+            return False
+        return True
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_post
 
