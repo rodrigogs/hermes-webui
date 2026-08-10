@@ -193,7 +193,7 @@ def test_sync_reads_the_conflicted_list_and_the_reason_correctly(monkeypatch):
     out = (
         "  9 commit(s) behind upstream (no local commits).\n"
         "  Merge plan: 2 step(s).\n"
-        "  conflicted:\n"
+        "  conflicted (2):\n"
         "    tools/delegate_tool.py\n"
         "    agent/conversation_loop.py\n"
         "  Conflict merging 9d4ef04ed. The fork was restored to 44c9871f8.\n"
@@ -205,6 +205,26 @@ def test_sync_reads_the_conflicted_list_and_the_reason_correctly(monkeypatch):
     assert body["ok"] is False
     assert body["reason"].startswith("Conflict merging"), body["reason"]
     assert body["conflicted"] == ["tools/delegate_tool.py", "agent/conversation_loop.py"]
+
+
+def test_sync_reads_a_conflicted_path_that_contains_a_space(monkeypatch):
+    """git prints a conflicted path with a space unquoted (verified:
+    `docs/my notes.md`). The previous parser ended the list at the first line
+    containing a space, so such a path became the "reason" and vanished from the
+    list. Reading the header's count is what removes the guesswork."""
+    out = (
+        "  2 commit(s) behind upstream (no local commits).\n"
+        "  conflicted (2):\n"
+        "    docs/my notes.md\n"
+        "    tools/delegate_tool.py\n"
+        "  Conflict merging 9d4ef04ed. The fork was restored to 44c9871f8.\n"
+    )
+    monkeypatch.setattr(bridge, "_run", _run_returns(1, out))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_post(h, _parsed("/api/fork-keeper/sync"), None)
+    body = h.payload()
+    assert body["conflicted"] == ["docs/my notes.md", "tools/delegate_tool.py"]
+    assert body["reason"].startswith("Conflict merging"), body["reason"]
 
 
 def test_sync_without_a_conflicted_block_still_reports_the_last_line(monkeypatch):

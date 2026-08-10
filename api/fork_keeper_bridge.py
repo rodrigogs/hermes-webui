@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -90,21 +91,24 @@ def _sync(dry_run: bool) -> tuple[int, dict]:
     # last conflicted path as the reason and then excluded it from the list, so on
     # the failure path that matters most the operator saw a bare filename as the
     # explanation and one file missing from the list.
+    # The CLI prints "conflicted (N):" and then exactly N indented paths, with the
+    # outcome sentence last. Reading the COUNT is what makes this exact: an earlier
+    # version ended the list at "the first line containing a space", and git prints
+    # a conflicted path with a space unquoted (verified: `docs/my notes.md`), so
+    # such a path was taken for the outcome and dropped from the list.
     conflicted: list[str] = []
     reason = ""
-    try:
-        marker = lines.index("conflicted:")
-    except ValueError:
-        marker = -1
+    marker = -1
+    count = 0
+    for i, line in enumerate(lines):
+        m = re.match(r"^conflicted \((\d+)\):$", line)
+        if m:
+            marker, count = i, int(m.group(1))
+            break
     if marker >= 0:
-        for line in lines[marker + 1:]:
-            # The outcome sentence ends the list; a path never contains a space.
-            if " " in line:
-                reason = line
-                break
-            conflicted.append(line)
-        if not reason:
-            reason = lines[-1] if lines else ""
+        conflicted = lines[marker + 1:marker + 1 + count]
+        rest = lines[marker + 1 + count:]
+        reason = rest[-1] if rest else (lines[-1] if lines else "")
     else:
         reason = lines[-1] if lines else (err or "").strip()
 
