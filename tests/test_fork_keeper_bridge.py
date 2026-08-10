@@ -180,6 +180,91 @@ def test_sync_reports_ok_false_on_nonzero_exit(monkeypatch):
     assert "restored" in h.payload()["reason"]
 
 
+def test_sync_reads_the_conflicted_list_and_the_reason_correctly(monkeypatch):
+    """The failure path that matters most has to be readable.
+
+    The CLI prints the conflicted files under a ``conflicted:`` header and the
+    outcome sentence last. The bridge used to guess which lines were paths
+    ("contains /, contains no space") and take the LAST line as the reason — so
+    with the list printed after the sentence it reported a bare filename as the
+    explanation of a failed merge and dropped that file from the list it showed.
+    Parsing by the header is what makes both fields true at once.
+    """
+    out = (
+        "  9 commit(s) behind upstream (no local commits).\n"
+        "  Merge plan: 2 step(s).\n"
+        "  conflicted:\n"
+        "    tools/delegate_tool.py\n"
+        "    agent/conversation_loop.py\n"
+        "  Conflict merging 9d4ef04ed. The fork was restored to 44c9871f8.\n"
+    )
+    monkeypatch.setattr(bridge, "_run", _run_returns(1, out))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_post(h, _parsed("/api/fork-keeper/sync"), None)
+    body = h.payload()
+    assert body["ok"] is False
+    assert body["reason"].startswith("Conflict merging"), body["reason"]
+    assert body["conflicted"] == ["tools/delegate_tool.py", "agent/conversation_loop.py"]
+
+
+def test_sync_without_a_conflicted_block_still_reports_the_last_line(monkeypatch):
+    out = (
+        "  2 commit(s) behind upstream (no local commits).\n"
+        "  Merged upstream in 1 step(s).\n"
+    )
+    monkeypatch.setattr(bridge, "_run", _run_returns(0, out))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_post(h, _parsed("/api/fork-keeper/sync"), None)
+    body = h.payload()
+    assert body["ok"] is True
+    assert body["reason"] == "Merged upstream in 1 step(s)."
+    assert body["conflicted"] == []
+
+
+def test_status_forwards_restart_pending(monkeypatch):
+    """The marker only means anything if it reaches the panel."""
+    payload = {"behind": 0, "ahead": 3, "diverged": False, "dirty": False,
+               "steps": 0, "conflict_prone": 0, "restart_pending": "45ec83deb"}
+    monkeypatch.setattr(bridge, "_run", _run_returns(0, json.dumps(payload)))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_get(h, _parsed("/api/fork-keeper/status"))
+    assert h.status == 200
+    assert h.payload()["restart_pending"] == "45ec83deb"
+
+
+def test_status_does_not_forward_a_cli_error_as_a_healthy_status(monkeypatch):
+    """rc 2 is "the upstream ref does not resolve" — a configuration fault.
+
+    Forwarding it as 200 would hand the panel an object with no commit count,
+    which the panel would then have to guess about. A 4xx says plainly that the
+    reading is unusable.
+    """
+    monkeypatch.setattr(bridge, "_run", _run_returns(
+        2, '{"error": "upstream/main does not resolve in /x. Fetch it first."}'))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_get(h, _parsed("/api/fork-keeper/status"))
+    assert h.status == 400
+    assert "does not resolve" in h.payload()["error"]
+    assert "behind" not in h.payload()
+
+
+def test_status_rejects_a_non_object_payload(monkeypatch):
+    """A bare JSON scalar parses fine but is not a status; forwarding it would
+    make the panel read attributes off a number."""
+    monkeypatch.setattr(bridge, "_run", _run_returns(0, "42"))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_get(h, _parsed("/api/fork-keeper/status"))
+    assert h.status == 502
+
+
+def test_status_reports_a_timeout_distinctly(monkeypatch):
+    monkeypatch.setattr(bridge, "_run", _run_returns(124, "", "timed out after 30s"))
+    h = FakeHandler()
+    bridge.handle_fork_keeper_get(h, _parsed("/api/fork-keeper/status"))
+    assert h.status == 504
+    assert "timed out" in h.payload()["error"]
+
+
 def test_dry_run_passes_the_flag_and_never_merges(monkeypatch):
     """Dry run must be incapable of mutating anything: if it ever omitted the
     flag it would merge while the operator believed they were previewing."""
@@ -237,6 +322,15 @@ def test_sync_surfaces_a_timeout_rather_than_claiming_success(monkeypatch):
     h = FakeHandler()
     bridge.handle_fork_keeper_post(h, _parsed("/api/fork-keeper/sync"), None)
     assert h.payload()["ok"] is False
+    # A timeout is NOT a merge outcome: the merge may still be running in the
+    # background, so the checkout's real state is unknown. 504 says that; a 200
+    # with ok:false says "we tried and it did not work", which is a different
+    # and misleading claim. Asserting only ok:false passed even with the timeout
+    # branch deleted, because rc != 0 already makes ok false.
+    assert h.status == 504, (
+        f"a timeout must not be reported as a completed merge attempt (got {h.status})"
+    )
+    assert "timed out" in h.payload()["reason"]
 
 
 # ---------------------------------------------------------------------------
