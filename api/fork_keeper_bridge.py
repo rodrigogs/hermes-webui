@@ -57,10 +57,20 @@ def _status() -> tuple[int, dict]:
     rc, out, err = _run(["sync-fork", "--json"], _TIMEOUT_STATUS)
     if rc == 127 or rc == 126:
         return 503, {"error": err}
+    if rc == 124:
+        return 504, {"error": err}
     try:
-        return 200, json.loads(out.strip().splitlines()[-1])
+        payload = json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
         return 502, {"error": "could not parse sync-fork output", "detail": (err or out)[:400]}
+    if not isinstance(payload, dict):
+        return 502, {"error": "sync-fork returned a non-object status"}
+    # The CLI reports an unresolvable upstream ref as {"error": ...} with rc 2.
+    # Forwarding that as a 200 would let a caller read a status object with no
+    # commit count as though it were a healthy fork.
+    if rc == 2 or "error" in payload:
+        return 400, payload
+    return 200, payload
 
 
 def _sync(dry_run: bool) -> tuple[int, dict]:
@@ -68,17 +78,43 @@ def _sync(dry_run: bool) -> tuple[int, dict]:
     rc, out, err = _run(args, _TIMEOUT_SYNC)
     if rc in (126, 127):
         return 503, {"ok": False, "reason": err}
+    if rc == 124:
+        return 504, {"ok": False, "reason": err}
 
     text = (out or "").strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    # sync-fork prints its status block first and the outcome last.
-    reason = lines[-1] if lines else (err or "").strip()
-    conflicted = [
-        line.strip()
-        for line in lines
-        if line.strip() and line.strip() not in reason and "/" in line and " " not in line.strip()
-    ]
-    return 200, {"ok": rc == 0, "reason": reason, "conflicted": conflicted}
+
+    # The CLI prints the conflicted list under a "conflicted:" header and the
+    # outcome sentence LAST. Parsing by that header rather than by guessing which
+    # lines look like paths: the old heuristic ("has a /, has no space") took the
+    # last conflicted path as the reason and then excluded it from the list, so on
+    # the failure path that matters most the operator saw a bare filename as the
+    # explanation and one file missing from the list.
+    conflicted: list[str] = []
+    reason = ""
+    try:
+        marker = lines.index("conflicted:")
+    except ValueError:
+        marker = -1
+    if marker >= 0:
+        for line in lines[marker + 1:]:
+            # The outcome sentence ends the list; a path never contains a space.
+            if " " in line:
+                reason = line
+                break
+            conflicted.append(line)
+        if not reason:
+            reason = lines[-1] if lines else ""
+    else:
+        reason = lines[-1] if lines else (err or "").strip()
+
+    payload = {"ok": rc == 0, "reason": reason, "conflicted": conflicted}
+    # rc 2 is "the upstream ref does not resolve" — a configuration fault, not a
+    # merge outcome. Say so distinctly so the panel does not render it as a
+    # merge that simply failed.
+    if rc == 2:
+        return 400, payload
+    return 200, payload
 
 
 def handle_fork_keeper_get(handler, parsed) -> bool | None:
