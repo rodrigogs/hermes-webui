@@ -6467,6 +6467,13 @@ def _read_live_provider_model_ids(provider_id: str) -> list[str]:
 def _models_from_live_provider_ids(provider_id: str, live_ids: list[str]) -> list[dict]:
     """Convert Hermes CLI model ids into WebUI picker model entries."""
     formatter = _format_ollama_label if provider_id in ("ollama", "ollama-cloud") else None
+    # The static table for this provider is consulted for labels before falling
+    # back to title-casing the id. Passing [] made every live id title-cased, which
+    # turns a Bedrock inference-profile id into "Us.anthropic.claude Opus 4 5
+    # 20251101 V1:0" — technically the id, but unreadable in a picker. The static
+    # entry already carries "Claude Opus 4.5"; _get_label_for_model prefers a known
+    # label and only invents one for ids the table does not list.
+    known_groups = [{"models": _PROVIDER_MODELS.get(provider_id, [])}]
     models: list[dict] = []
     seen: set[str] = set()
     for mid in live_ids:
@@ -6474,7 +6481,7 @@ def _models_from_live_provider_ids(provider_id: str, live_ids: list[str]) -> lis
         if not mid_s or mid_s in seen:
             continue
         seen.add(mid_s)
-        label = formatter(mid_s) if formatter else _get_label_for_model(mid_s, [])
+        label = formatter(mid_s) if formatter else _get_label_for_model(mid_s, known_groups)
         models.append({"id": mid_s, "label": label})
     return models
 
