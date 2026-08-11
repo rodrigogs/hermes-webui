@@ -1179,6 +1179,11 @@ _PROVIDER_DISPLAY = {
     "copilot": "GitHub Copilot",
     "moa": "Mixture of Agents",
     "cursor-acp": "Cursor ACP",
+    # Without an entry the picker titlecases the slug into "Copilot Acp", which
+    # names the transport and hides what actually answers. On this install the ACP
+    # executor is Claude Code on another host, and the models offered are that
+    # host's — so the label says so.
+    "copilot-acp": "Claude Code (ACP)",
     "zai": "Z.AI / GLM",
     "kimi-coding": "Kimi / Moonshot",
     "deepseek": "DeepSeek",
@@ -1792,6 +1797,30 @@ _PROVIDER_MODELS = {
         {"id": "cursor/composer-2", "label": "Composer 2"},
         {"id": "cursor/default", "label": "Default"},
         {"id": "cursor-acp", "label": "Cursor ACP"},
+    ],
+    # Copilot ACP — the ACP stdio transport. On this install the executor is
+    # Claude Code on another host (HERMES_COPILOT_ACP_COMMAND), so these are the
+    # models that host's gate accepts, mirroring
+    # hermes_cli.models._PROVIDER_MODELS["copilot-acp"].
+    #
+    # This entry has to exist even though _read_live_provider_model_ids() answers
+    # correctly: without it the picker fell through to _PROVIDER_MODELS["copilot"]
+    # and offered GitHub Copilot's 17 gpt-*/gemini ids under the ACP label, none of
+    # which the executor can serve. Observed on the live install, where the live
+    # rebuild logged "provider-catalog rebuild exceeded 4.0s budget — serving
+    # fallback" and this fallback is what the operator actually saw.
+    "copilot-acp": [
+        {"id": "us.anthropic.claude-opus-5", "label": "Claude Opus 5"},
+        {"id": "us.anthropic.claude-sonnet-5", "label": "Claude Sonnet 5"},
+        {"id": "us.anthropic.claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"id": "us.anthropic.claude-opus-4-7", "label": "Claude Opus 4.7"},
+        {"id": "us.anthropic.claude-opus-4-6-v1", "label": "Claude Opus 4.6"},
+        {"id": "us.anthropic.claude-opus-4-5-20251101-v1:0", "label": "Claude Opus 4.5"},
+        {"id": "us.anthropic.claude-opus-4-1-20250805-v1:0", "label": "Claude Opus 4.1"},
+        {"id": "us.anthropic.claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
+        {"id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "label": "Claude Sonnet 4.5"},
+        {"id": "us.anthropic.claude-sonnet-4-20250514-v1:0", "label": "Claude Sonnet 4"},
+        {"id": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "label": "Claude Haiku 4.5"},
     ],
     # OpenCode Zen — curated models via opencode.ai/zen (pay-as-you-go credits)
     "opencode-zen": [
