@@ -844,6 +844,13 @@ async function _pollManualCompressionResult(sid){
     const data=await api(`/api/session/compress/status?session_id=${encodeURIComponent(sid)}`);
     if(data&&data.status==='done') return data;
     if(data&&data.status==='error'){
+      // Stale-runtime watch: the manual-compression worker reports a stale
+      // Agent runtime inside the job payload ({error_type, error_status:409},
+      // routes.py:24812) with HTTP 200 — it never reaches the api() error
+      // hook, so it must be detected here where the payload is consumed.
+      if(typeof runtimeStaleMaybeShow==='function'){
+        try{ runtimeStaleMaybeShow(data); }catch(_){ }
+      }
       const err=new Error(data.error||'Compression failed');
       err.status=data.error_status||400;
       throw err;

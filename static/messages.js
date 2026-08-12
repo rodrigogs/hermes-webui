@@ -1821,6 +1821,19 @@ async function send(){
     // lost. Put back the ORIGINAL captured draft (not the mutated /moa/bundle
     // payload) and re-stage files so the user can re-send without retyping.
     _restoreComposerDraftAfterFailedSend(_failedSendDraftText, _failedSendFilesSnapshot, activeSid, _composerDraftClearPromise);
+    // Stale-runtime guard: the generic restore above is in-memory only, and
+    // send() already cleared the server-side draft — but the stale flow ends
+    // in a WebUI restart, which would take the restored draft with it. Persist
+    // the ORIGINAL text so the restart cannot lose the message (the banner's
+    // boot hook restores it into an empty composer). Files are Blobs and
+    // cannot be re-staged from localStorage — the banner copy says to
+    // re-attach them after the restart.
+    if(typeof runtimeStaleInfo==='function'&&typeof runtimeStaleSaveDraft==='function'){
+      try{
+        const _staleInfo=runtimeStaleInfo(e);
+        if(_staleInfo) runtimeStaleSaveDraft(_failedSendDraftText||msgText);
+      }catch(_){ }
+    }
     if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
     // Reconcile with server truth after immediately clearing the optimistic spinner.
     if(typeof renderSessionList==='function') void renderSessionList();

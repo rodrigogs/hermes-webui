@@ -75,6 +75,14 @@ async function api(path,opts={}){
           err.status=res.status;
           err.statusText=res.statusText;
           err.body=text;
+          // Stale-runtime watch: one detector for every producer that returns
+          // the typed 409 (the shared barrier's six consumers plus the four
+          // hand-built sites). The banner is idempotent — it stays visible
+          // until the WebUI restarts or the user dismisses. Best-effort: a
+          // broken banner must never alter the request's error contract.
+          if(typeof runtimeStaleMaybeShow==='function'){
+            try{ runtimeStaleMaybeShow(err); }catch(_){ }
+          }
           throw err;
         }
         const ct=res.headers.get('content-type')||'';

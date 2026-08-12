@@ -480,6 +480,16 @@
         <button class="agent-health-dismiss" id="agentHealthDismiss" type="button" onclick="dismissAgentHealthAlert()" aria-label="Dismiss Hermes agent heartbeat alert">Dismiss</button>
       </div>
     </div>
+    <div class="agent-health-banner" id="runtimeStaleBanner" role="alert" aria-live="assertive" hidden>
+      <div class="agent-health-copy">
+        <strong id="runtimeStaleTitle">Hermes Agent was updated while Hermes WebUI was running</strong>
+        <span id="runtimeStaleDetails">The running WebUI still executes the old code. Your message is saved — restart to load the update, then re-send. Re-attach files after the restart.</span>
+      </div>
+      <div class="agent-health-actions">
+        <button class="agent-health-restart" id="btnRuntimeStaleRestart" type="button" onclick="runtimeStaleRestart()">Restart Hermes WebUI</button>
+        <button class="agent-health-dismiss" id="runtimeStaleDismiss" type="button" onclick="runtimeStaleDismiss()" aria-label="Dismiss Hermes WebUI stale runtime alert">Dismiss</button>
+      </div>
+    </div>
     <div class="composer-wrap" id="composerWrap">
       <div class="composer-flyout">
       <!-- Queue flyout: slides up from behind composer, same pattern as approval-card -->
@@ -1773,6 +1783,7 @@
 <script src="static/icons.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/assistant_turn_anchors.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/ui.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/runtime_stale.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/workspace.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/terminal.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/sessions.js?v=__WEBUI_VERSION__" defer></script>
