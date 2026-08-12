@@ -34,6 +34,9 @@ const DEFAULT_RUNTIME_STALE_MESSAGE =
 
 const RUNTIME_STALE_DRAFT_KEY = 'hermes-webui-stale-draft';
 
+// The banner's shipped guidance, captured on first show.
+let _runtimeStaleBaseCopy = null;
+
 // Pure detector: returns {message, status} for a stale-runtime error/payload,
 // else null. Never throws.
 function runtimeStaleInfo(value) {
@@ -72,7 +75,25 @@ function runtimeStaleShow(info) {
   if (!banner) return;
   if (info && info.message) {
     const details = document.getElementById('runtimeStaleDetails');
-    if (details) details.textContent = info.message;
+    // The static copy carries the two facts the server cannot know: that the
+    // message was saved, and that files were not. Append the server text only
+    // when it adds something the title does not already say.
+    if (details) {
+      // Capture the shipped copy once, in a module variable rather than a data-
+      // attribute: this must not depend on the element carrying a dataset, and
+      // re-reading textContent after the first show would capture our own
+      // appended text and compound it on every subsequent 409.
+      if (_runtimeStaleBaseCopy === null) {
+        _runtimeStaleBaseCopy = String(details.textContent || '');
+      }
+      const base = _runtimeStaleBaseCopy;
+      const extra = String(info.message || '').trim();
+      const titleEl = document.getElementById('runtimeStaleTitle');
+      const title = String((titleEl && titleEl.textContent) || '').trim();
+      const redundant = !extra || title && extra.replace(/[.\s]+$/, '').indexOf(
+        title.replace(/[.\s]+$/, '')) === 0;
+      details.textContent = redundant ? base : base + ' (' + extra + ')';
+    }
   }
   banner.hidden = false;
   banner.classList.add('visible');
@@ -165,6 +186,28 @@ async function runtimeStaleRestart() {
 function runtimeStaleSaveDraft(text) {
   if (!text) return;
   try {
+    // A second stale failure must not destroy the first unsent message: the
+    // first is the one the user already lost a turn to.
+    const existing = localStorage.getItem(RUNTIME_STALE_DRAFT_KEY);
+    if (existing) {
+      try {
+        const prev = JSON.parse(existing);
+        if (prev && typeof prev.text === 'string' && prev.text.trim()) {
+          const ts = Number(prev.ts);
+          const fresh = !Number.isFinite(ts) ||
+            Date.now() - ts <= RUNTIME_STALE_DRAFT_MAX_AGE_MS;
+          if (fresh && prev.text !== String(text)) {
+            localStorage.setItem(RUNTIME_STALE_DRAFT_KEY, JSON.stringify({
+              text: prev.text + '\n\n' + String(text),
+              ts: Number.isFinite(ts) ? ts : Date.now(),
+            }));
+            return;
+          }
+        }
+      } catch (_) {
+        /* unparseable previous draft: fall through and overwrite it */
+      }
+    }
     localStorage.setItem(
       RUNTIME_STALE_DRAFT_KEY,
       JSON.stringify({ text: String(text), ts: Date.now() })
@@ -174,15 +217,36 @@ function runtimeStaleSaveDraft(text) {
   }
 }
 
+// Defect E: a draft older than this is not restored. ts was previously written
+// and never read, which implied a freshness guarantee that did not exist.
+const RUNTIME_STALE_DRAFT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+// Reads WITHOUT consuming: the caller clears the key only once it has actually
+// delivered the text. Consuming here destroyed the message whenever delivery
+// was impossible (no composer yet) or refused (composer not empty), while the
+// banner promised "Your message is saved".
 function runtimeStaleRestoreDraft() {
   try {
     const raw = localStorage.getItem(RUNTIME_STALE_DRAFT_KEY);
     if (!raw) return '';
-    localStorage.removeItem(RUNTIME_STALE_DRAFT_KEY);
     const data = JSON.parse(raw);
-    return data && typeof data.text === 'string' ? data.text : '';
+    if (!data || typeof data.text !== 'string') return '';
+    const ts = Number(data.ts);
+    if (Number.isFinite(ts) && Date.now() - ts > RUNTIME_STALE_DRAFT_MAX_AGE_MS) {
+      localStorage.removeItem(RUNTIME_STALE_DRAFT_KEY);
+      return '';
+    }
+    return data.text;
   } catch (_) {
     return '';
+  }
+}
+
+function runtimeStaleClearDraft() {
+  try {
+    localStorage.removeItem(RUNTIME_STALE_DRAFT_KEY);
+  } catch (_) {
+    /* nothing to clear */
   }
 }
 
@@ -190,8 +254,11 @@ function runtimeStaleInit() {
   const text = runtimeStaleRestoreDraft();
   if (!text) return;
   const inp = document.getElementById('msg');
-  // Never clobber text the user typed (or a server draft restored) meanwhile.
+  // Never clobber text the user typed (or a server draft restored) meanwhile —
+  // and leave the key in place when we cannot deliver, so the message is
+  // recoverable on the next boot instead of destroyed now.
   if (inp && !String(inp.value || '').trim()) {
+    runtimeStaleClearDraft();
     inp.value = text;
     if (typeof autoResize === 'function') autoResize();
     if (typeof updateSendBtn === 'function') updateSendBtn();
@@ -217,6 +284,7 @@ if (typeof module !== 'undefined' && module.exports) {
     runtimeStaleRestart,
     runtimeStaleSaveDraft,
     runtimeStaleRestoreDraft,
+    runtimeStaleClearDraft,
     RUNTIME_STALE_DRAFT_KEY,
     DEFAULT_RUNTIME_STALE_MESSAGE,
   };

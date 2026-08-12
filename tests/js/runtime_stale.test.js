@@ -279,14 +279,26 @@ function installFakeLocalStorage() {
   return fake;
 }
 
-test('draft roundtrip: save then restore, key consumed on restore', () => {
+test('draft roundtrip: save then restore, key consumed only once delivered', () => {
+  // This test previously asserted that restore CONSUMES the key. That was the
+  // mechanism, and it was the defect: restore had no way to know whether the
+  // caller could actually deliver the text, so a restore into a non-empty
+  // composer (or with no composer yet) destroyed the message while the banner
+  // promised "Your message is saved". Reading is now non-destructive and the
+  // caller clears explicitly after delivering. Asserting the property, not the
+  // mechanism.
   const ls = installFakeLocalStorage();
   stale.runtimeStaleSaveDraft('my important message');
   assert.ok(ls.getItem(stale.RUNTIME_STALE_DRAFT_KEY));
 
   const restored = stale.runtimeStaleRestoreDraft();
   assert.equal(restored, 'my important message');
-  assert.equal(ls.getItem(stale.RUNTIME_STALE_DRAFT_KEY), null);
+  assert.ok(ls.getItem(stale.RUNTIME_STALE_DRAFT_KEY),
+    'a read must not destroy the draft before it has been delivered');
+
+  stale.runtimeStaleClearDraft();
+  assert.equal(ls.getItem(stale.RUNTIME_STALE_DRAFT_KEY), null,
+    'an explicit clear after delivery must consume the draft');
 });
 
 test('draft restore returns empty string when nothing was saved', () => {
