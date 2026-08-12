@@ -81,6 +81,72 @@ def test_project_assigned_cli_session_survives_recent_session_limit(
     assert [session["session_id"] for session in sessions].count("older-assigned") == 1
 
 
+def test_project_assigned_ended_single_turn_session_survives_cli_visibility_gate(
+    fake_hermes_home, monkeypatch
+):
+    """A Project chip must be able to reveal an otherwise-hidden real CLI turn."""
+    monkeypatch.setattr(models, "CLI_VISIBLE_SESSION_LIMIT", 5)
+    db_path = fake_hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            model TEXT,
+            message_count INTEGER,
+            started_at REAL,
+            source TEXT,
+            project_id TEXT,
+            ended_at REAL,
+            end_reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            timestamp REAL,
+            role TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, title, model, message_count, started_at, source, project_id, ended_at, end_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "ended-assigned",
+            None,
+            "gpt-x",
+            2,
+            1700000000.0,
+            "cli",
+            "project-123",
+            1700000001.0,
+            "agent_close",
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO messages (session_id, timestamp, role) VALUES (?, ?, ?)",
+        [
+            ("ended-assigned", 1700000000.1, "user"),
+            ("ended-assigned", 1700000000.2, "assistant"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    sessions = models.get_cli_sessions()
+    by_id = {session["session_id"]: session for session in sessions}
+
+    assert by_id["ended-assigned"]["project_id"] == "project-123"
+
+
 @pytest.mark.parametrize(
     ("root_project_id", "tip_project_id"),
     [
@@ -235,3 +301,112 @@ def test_route_cap_preserves_project_assigned_overflow_as_hidden():
     assert "unassigned-overflow" not in by_id
     assert by_id["assigned-overflow"]["default_hidden"] is True
     assert "default_hidden" not in assigned_overflow
+
+
+def test_route_dedupe_retains_project_assigned_ended_single_turn_cli_session():
+    row = {
+        "session_id": "ended-assigned",
+        "source": "cli",
+        "source_tag": "cli",
+        "is_cli_session": True,
+        "title": None,
+        "message_count": 2,
+        "actual_message_count": 2,
+        "actual_user_message_count": 1,
+        "ended_at": 1700000001.0,
+        "end_reason": "agent_close",
+        "project_id": "project-123",
+    }
+
+    rows = routes._dedupe_cli_sidebar_sessions_for_api([row], set())
+
+    assert [session["session_id"] for session in rows] == ["ended-assigned"]
+
+
+def test_sidebar_sidecar_inherits_project_id_from_matching_cli_metadata(monkeypatch):
+    sidecar = {
+        "session_id": "imported-cli",
+        "title": "Imported CLI conversation",
+        "message_count": 2,
+        "profile": "default",
+        "is_cli_session": True,
+        "source_tag": "cli",
+        "raw_source": "cli",
+        "session_source": "cli",
+        "source_label": "CLI",
+        "created_at": 10.0,
+        "updated_at": 11.0,
+        "last_message_at": 11.0,
+        "archived": False,
+    }
+    cli_metadata = {
+        **sidecar,
+        "project_id": "project-123",
+        "actual_message_count": 2,
+        "actual_user_message_count": 1,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda **_: [dict(sidecar)])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda **_: [dict(cli_metadata)])
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _: False)
+    monkeypatch.setattr(routes, "_prune_orphaned_webui_zero_message_sessions", lambda rows, **_: rows)
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_claude_code_sessions=True,
+        include_archived=False,
+        exclude_hidden=False,
+        visible_only=False,
+        show_webhook_sessions=False,
+    )
+
+    row = next(session for session in payload["sessions"] if session["session_id"] == "imported-cli")
+    assert row["project_id"] == "project-123"
+
+
+def test_sidebar_sidecar_keeps_its_existing_project_id_over_cli_metadata(monkeypatch):
+    sidecar = {
+        "session_id": "imported-cli",
+        "title": "Imported CLI conversation",
+        "message_count": 2,
+        "profile": "default",
+        "is_cli_session": True,
+        "source_tag": "cli",
+        "raw_source": "cli",
+        "session_source": "cli",
+        "source_label": "CLI",
+        "project_id": "sidecar-project",
+        "created_at": 10.0,
+        "updated_at": 11.0,
+        "last_message_at": 11.0,
+        "archived": False,
+    }
+    cli_metadata = {
+        **sidecar,
+        "project_id": "state-db-project",
+        "actual_message_count": 2,
+        "actual_user_message_count": 1,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda **_: [dict(sidecar)])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda **_: [dict(cli_metadata)])
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _: False)
+    monkeypatch.setattr(routes, "_prune_orphaned_webui_zero_message_sessions", lambda rows, **_: rows)
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_claude_code_sessions=True,
+        include_archived=False,
+        exclude_hidden=False,
+        visible_only=False,
+        show_webhook_sessions=False,
+    )
+
+    row = next(session for session in payload["sessions"] if session["session_id"] == "imported-cli")
+    assert row["project_id"] == "sidecar-project"

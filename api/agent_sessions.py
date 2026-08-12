@@ -305,6 +305,24 @@ def is_cli_session_row_visible(row: dict) -> bool:
     return _count_user_turns(row) >= CLI_MIN_UNTITLED_USER_MESSAGE_COUNT
 
 
+def is_project_assigned_cli_session_row_visible(row: dict) -> bool:
+    """Return whether an otherwise-hidden CLI row is addressable by a Project.
+
+    Project assignment is explicit user intent, so a selected project may reveal
+    a real one-turn CLI conversation that the default sidebar deliberately hides
+    as low-value untitled noise. This is intentionally narrower than the normal
+    visibility predicate: no project, no actual messages, no user turn, or a
+    non-CLI source remains hidden.
+    """
+    return bool(
+        isinstance(row, dict)
+        and str(row.get("project_id") or "").strip()
+        and is_cli_session_row(row)
+        and _as_positive_int(row.get("actual_message_count")) > 0
+        and _count_user_turns(row) > 0
+    )
+
+
 def _is_continuation_session(parent: dict | None, child: dict | None) -> bool:
     """Return True when ``child`` is the next segment of the same conversation.
 
@@ -830,7 +848,20 @@ def read_importable_agent_session_rows(
             )
         projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
         projected = [_with_normalized_source(row) for row in projected]
-        projected = [row for row in projected if is_cli_session_row_visible(row)]
+        if require_project_id:
+            # The normal CLI sidebar gate suppresses ended, untitled one-turn
+            # rows to avoid noise. A durable project assignment is explicit
+            # user intent, though: retain real user conversations for the
+            # project-only pass so a project chip can reveal them. The route
+            # still keeps overflow rows hidden from the default All view.
+            projected = [
+                row
+                for row in projected
+                if is_cli_session_row_visible(row)
+                or is_project_assigned_cli_session_row_visible(row)
+            ]
+        else:
+            projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
             return projected
         return projected[:max(0, int(limit))]
