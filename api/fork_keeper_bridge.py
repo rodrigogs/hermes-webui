@@ -54,12 +54,80 @@ def _run(args: list[str], timeout: int) -> tuple[int, str, str]:
         return 126, "", str(exc)
 
 
+_INVALID_CHOICE = re.compile(r"invalid choice: ['\"]sync-fork['\"]")
+
+
+def _no_subcommand(rc: int, out: str, err: str) -> bool:
+    """True when this install's CLI has no ``sync-fork`` at all.
+
+    argparse rejects an unknown subcommand with rc 2, its usage block on stderr and
+    NOTHING on stdout. That empty stdout reached the JSON parse as an empty line
+    list, so the operator was told "could not parse sync-fork output" — a sentence
+    that names neither the cause nor a fix, and reads like the CLI misbehaved when
+    in fact it was never asked anything it understood.
+
+    Two signals rather than one: the message is the precise tell, but argparse
+    localises nothing while a future release could reword it, so an rc 2 that
+    produced a usage block and no stdout counts too.
+    """
+    if rc != 2:
+        return False
+    if _INVALID_CHOICE.search(err or ""):
+        return True
+    return not (out or "").strip() and "usage: hermes" in (err or "")
+
+
+def _checkout_branch() -> str:
+    """The branch the agent checkout is on — the missing subcommand's usual cause.
+
+    Asked of git, not of the CLI: the CLI is the thing that cannot answer. Purely
+    best-effort — no git, no repo or a detached HEAD simply leaves the branch out
+    of the message rather than failing the request.
+    """
+    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(home / "hermes-agent"), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    branch = (proc.stdout or "").strip()
+    return "" if proc.returncode or branch in ("", "HEAD") else branch
+
+
+def _missing_subcommand_payload() -> dict:
+    """Name the cause and the fix, because the panel can do neither.
+
+    The panel only knows that no commit count arrived. Which checkout is being
+    asked, and what is missing from it, is visible only here.
+    """
+    branch = _checkout_branch()
+    where = f", checked out on {branch}" if branch else ""
+    return {
+        "error": f"this install's hermes CLI has no sync-fork subcommand{where}",
+        # No backticks: this string is rendered as plain text in the panel, where
+        # they read as stray punctuation rather than as code marks.
+        "fix": (
+            "The panel, the CLI and the fork-keeper cron all call the same "
+            "sync-fork subcommand, so none of them can report the fork's position "
+            "until the agent checkout carries it again."
+        ),
+    }
+
+
 def _status() -> tuple[int, dict]:
     rc, out, err = _run(["sync-fork", "--json"], _TIMEOUT_STATUS)
     if rc == 127 or rc == 126:
         return 503, {"error": err}
     if rc == 124:
         return 504, {"error": err}
+    # Before the parse, not after: this case produces no stdout at all, so it can
+    # only be told apart from real garbage by why it is empty.
+    if _no_subcommand(rc, out, err):
+        return 501, _missing_subcommand_payload()
     try:
         payload = json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -81,6 +149,20 @@ def _sync(dry_run: bool) -> tuple[int, dict]:
         return 503, {"ok": False, "reason": err}
     if rc == 124:
         return 504, {"ok": False, "reason": err}
+    # Same fault as the status read, and it has to be caught before the outcome
+    # parser: with no stdout, "the outcome sentence is the last line" would take a
+    # line of the argparse usage block as the reason for a merge that never ran.
+    if _no_subcommand(rc, out, err):
+        missing = _missing_subcommand_payload()
+        return 501, {
+            "ok": False,
+            # Both keys: the panel reads `reason` for an outcome it rendered and
+            # `error` for a non-2xx it threw on, and this answer is both.
+            "error": missing["error"],
+            "reason": missing["error"],
+            "fix": missing["fix"],
+            "conflicted": [],
+        }
 
     text = (out or "").strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
