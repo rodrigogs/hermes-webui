@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _TIMEOUT_STATUS = 30
@@ -241,9 +242,47 @@ def _schedules() -> dict:
             "enabled": bool(job.get("enabled", True)),
             "schedule": sched.get("display") or sched.get("expr")
             or (f"every {sched.get('minutes')}m" if sched.get("minutes") else ""),
+            # The raw interval, for _project_next_run. The display string above is
+            # for humans and is not always parseable back into a number.
+            "interval_minutes": sched.get("minutes") if sched.get("kind") == "interval" else None,
             "next_run": job.get("next_run") or "",
         }
     return out
+
+
+def _project_next_run(job: dict, which: str, history: list) -> None:
+    """Fill in an interval job's next run, counting from its last ATTEMPT.
+
+    The registry leaves ``next_run`` empty on this install, so the panel fell back
+    to projecting from ``last_run`` — which the cron body writes only when a sync
+    reaches an outcome. A run that started and bailed early (dirty worktree, a lock
+    it could not take, a CLI missing the subcommand) leaves no outcome at all, so
+    the two sources diverge and the projection is wrong by a whole interval.
+
+    Measured 2026-08-19: the panel showed "20 Aug 02:15" while the scheduler said
+    "21 Aug 18:56:56", because the attempt at 19 Aug 18:56 never reached the state
+    file. A wrong time on screen is worse than no time, so count from the same
+    event the scheduler counts from.
+
+    Only interval schedules are projected. A cron expression is a wall-clock time
+    the panel can already derive from the expression itself.
+    """
+    if job.get("next_run"):
+        return
+    minutes = job.get("interval_minutes")
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        return
+    started = next(
+        (r.get("started_at") for r in history if r.get("job") == which and r.get("started_at")),
+        None,
+    )
+    if not started:
+        return
+    try:
+        base = datetime.fromisoformat(str(started))
+    except ValueError:
+        return
+    job["next_run"] = (base + timedelta(minutes=float(minutes))).isoformat()
 
 
 def _history(job_ids: dict, limit: int = 6) -> list:
@@ -305,12 +344,19 @@ def _overview() -> tuple[int, dict]:
     except OSError:
         pending_commit = ""
 
+    history = _history(job_ids)
+    sync = {**_read_json(_state_dir() / "fork-keeper.json"), **(scheds.get("sync") or {})}
+    prs = {**_read_json(_state_dir() / "fork-keeper-prs.json"), **(scheds.get("prs") or {})}
+    # After the merge, so a real next_run from the registry always wins.
+    _project_next_run(sync, "sync", history)
+    _project_next_run(prs, "prs", history)
+
     payload = {
         "status": status,
         "status_code": code,
-        "sync": {**_read_json(_state_dir() / "fork-keeper.json"), **(scheds.get("sync") or {})},
-        "prs": {**_read_json(_state_dir() / "fork-keeper-prs.json"), **(scheds.get("prs") or {})},
-        "history": _history(job_ids),
+        "sync": sync,
+        "prs": prs,
+        "history": history,
         "restart_pending": pending_commit,
     }
     # The overview is a view: a failed status read is reported INSIDE it (as

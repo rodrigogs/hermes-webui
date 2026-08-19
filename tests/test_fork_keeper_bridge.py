@@ -412,3 +412,57 @@ def test_returns_none_when_no_cli_can_be_found(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(bridge.shutil, "which", lambda _: None)
     assert bridge._hermes_cli() is None
+def test_next_run_counts_from_the_last_attempt_not_the_last_outcome():
+    """The projection must agree with the scheduler, which counts from the attempt.
+
+    The cron body writes its state file only when a sync reaches an outcome, so a
+    run that started and bailed early leaves the outcome untouched. Projecting the
+    next run from that outcome is then wrong by a whole interval — measured on a
+    live install as "20 Aug 02:15" on screen against "21 Aug 18:56:56" in the
+    scheduler, because the 19 Aug 18:56 attempt never reached the state file.
+    """
+    job = {
+        "interval_minutes": 2880,
+        "next_run": "",
+        # The stale outcome the old projection used: two days older than the
+        # attempt below, which is exactly how the interval got skipped.
+        "last_run": "2026-08-18T02:15:10-03:00",
+    }
+    history = [
+        {"job": "prs", "status": "completed", "started_at": "2026-08-19T09:00:01-03:00"},
+        {"job": "sync", "status": "completed", "started_at": "2026-08-19T18:56:56-03:00"},
+    ]
+    bridge._project_next_run(job, "sync", history)
+    assert job["next_run"].startswith("2026-08-21T18:56:56")
+
+
+def test_next_run_from_the_registry_is_never_overwritten():
+    """A real next_run wins; the projection is a fallback for an empty one."""
+    job = {"interval_minutes": 2880, "next_run": "2026-09-01T00:00:00-03:00"}
+    history = [{"job": "sync", "started_at": "2026-08-19T18:56:56-03:00"}]
+    bridge._project_next_run(job, "sync", history)
+    assert job["next_run"] == "2026-09-01T00:00:00-03:00"
+
+
+def test_a_cron_expression_schedule_is_not_projected_here():
+    """Only interval jobs. A cron expression is a wall-clock time the panel reads
+    off the expression itself, and inventing one here would fight that."""
+    job = {"interval_minutes": None, "next_run": ""}
+    history = [{"job": "prs", "started_at": "2026-08-19T09:00:01-03:00"}]
+    bridge._project_next_run(job, "prs", history)
+    assert job["next_run"] == ""
+
+
+def test_no_attempt_on_record_means_no_invented_time():
+    """A job that has never run gets no projection, so the panel says unknown
+    instead of naming a time nothing supports."""
+    job = {"interval_minutes": 2880, "next_run": ""}
+    bridge._project_next_run(job, "sync", [])
+    assert job["next_run"] == ""
+
+
+def test_an_unparseable_attempt_timestamp_is_ignored():
+    """A malformed row must not raise inside a read-only overview."""
+    job = {"interval_minutes": 2880, "next_run": ""}
+    bridge._project_next_run(job, "sync", [{"job": "sync", "started_at": "not-a-date"}])
+    assert job["next_run"] == ""
