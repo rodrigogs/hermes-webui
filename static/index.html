@@ -17,7 +17,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Hermes">
 <link rel="apple-touch-icon" sizes="512x512" href="static/apple-touch-icon.png">
-<script>(function(){try{var themes={light:1,dark:1,system:1},skins={codex:1,terracotta:1,default:1,ares:1,mono:1,graphite:1,github:1,slate:1,poseidon:1,sisyphus:1,charizard:1,sienna:1,catppuccin:1,hepburn:1,nous:1,'geist-contrast':1,neon:1,'neon-soft':1,'neon-paint':1,zeus:1,'verdigris':1},legacy={slate:['dark','slate'],solarized:['dark','poseidon'],monokai:['dark','sisyphus'],nord:['dark','slate'],oled:['dark','default']},t=(localStorage.getItem('hermes-theme')||'dark').toLowerCase(),s=(localStorage.getItem('hermes-skin')||'').toLowerCase(),m=legacy[t],theme=m?m[0]:(themes[t]?t:'dark');var pendingExt=s&&s!=='default'&&!skins[s]&&!legacy[s];var skin=skins[s]?s:(pendingExt?s:(m?m[1]:'default'));localStorage.setItem('hermes-theme',theme);localStorage.setItem('hermes-skin',skin);if(theme==='system')theme=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';if(theme==='dark')document.documentElement.classList.add('dark');if(skin!=='default')document.documentElement.dataset.skin=skin;}catch(e){document.documentElement.classList.add('dark');}})()</script>
+<script>(function(){try{var _hadAppearance=localStorage.getItem('hermes-theme')!==null||localStorage.getItem('hermes-skin')!==null;var themes={light:1,dark:1,system:1},skins={codex:1,terracotta:1,default:1,ares:1,mono:1,graphite:1,github:1,slate:1,poseidon:1,sisyphus:1,charizard:1,sienna:1,catppuccin:1,hepburn:1,nous:1,'geist-contrast':1,neon:1,'neon-soft':1,'neon-paint':1,zeus:1,'verdigris':1},legacy={slate:['dark','slate'],solarized:['dark','poseidon'],monokai:['dark','sisyphus'],nord:['dark','slate'],oled:['dark','default']},t=(localStorage.getItem('hermes-theme')||'dark').toLowerCase(),s=(localStorage.getItem('hermes-skin')||'').toLowerCase(),m=legacy[t],theme=m?m[0]:(themes[t]?t:'dark');var pendingExt=s&&s!=='default'&&!skins[s]&&!legacy[s];var skin=skins[s]?s:(pendingExt?s:(m?m[1]:'default'));if(_hadAppearance){localStorage.setItem('hermes-theme',theme);localStorage.setItem('hermes-skin',skin);}if(theme==='system')theme=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';if(theme==='dark')document.documentElement.classList.add('dark');if(skin!=='default')document.documentElement.dataset.skin=skin;}catch(e){document.documentElement.classList.add('dark');}})()</script>
 <script>(function(){try{var fs=localStorage.getItem('hermes-font-size');if(fs&&fs!=='default')document.documentElement.dataset.fontSize=fs;}catch(e){}})()</script>
 <!-- theme-color: surfaces the active app chrome color to native status bars (Safari status bar, PWA, native WKWebView wrappers). Updated dynamically by boot.js when theme/skin changes. The light/dark default values match style.css :root --sidebar / :root.dark --sidebar. -->
 <meta name="theme-color" content="#FAF7F0" media="(prefers-color-scheme: light)">
@@ -1801,6 +1801,7 @@
     <h3 id="kanbanBoardModalTitle" data-i18n="kanban_new_board">New board</h3>
     <input type="hidden" id="kanbanBoardModalMode" value="create">
     <input type="hidden" id="kanbanBoardModalSlug" value="">
+    <input type="hidden" id="kanbanBoardModalOriginalDefaultWorkdir" value="">
     <div class="kanban-modal-row">
       <label for="kanbanBoardModalName" data-i18n="kanban_board_name">Name</label>
       <input type="text" id="kanbanBoardModalName" maxlength="64" placeholder="e.g. Experiments" autocomplete="off">
@@ -1812,6 +1813,11 @@
     <div class="kanban-modal-row">
       <label for="kanbanBoardModalDesc" data-i18n="kanban_board_description">Description (optional)</label>
       <textarea id="kanbanBoardModalDesc" maxlength="200"></textarea>
+    </div>
+    <div class="kanban-modal-row">
+      <label for="kanbanBoardModalDefaultWorkdir" data-i18n="kanban_board_default_workdir">Default workspace path</label>
+      <input type="text" id="kanbanBoardModalDefaultWorkdir" list="kanbanBoardModalWorkdirs" maxlength="255" data-i18n-placeholder="kanban_board_default_workdir_placeholder" placeholder="Workspace path (optional)" autocomplete="off">
+      <datalist id="kanbanBoardModalWorkdirs"></datalist>
     </div>
     <div class="kanban-modal-row-inline">
       <div class="kanban-modal-row">

@@ -21,6 +21,7 @@ import threading
 import time
 import traceback
 import copy
+import inspect
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,11 @@ from api.config import (
     _main_model_request_overrides,
     PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
-from api.helpers import redact_session_data, _redact_text
+from api.helpers import (
+    redact_session_data,
+    scrub_internal_replay_fields,
+    _redact_text,
+)
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
 from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
@@ -80,6 +85,61 @@ from api.process_event_utils import (
 )
 
 
+def get_stream_runtime_snapshot() -> dict[str, object]:
+    """Return aggregate stream observations without waiting on the registry.
+
+    The registry is copied under a nonblocking ``STREAMS_LOCK`` acquire and the
+    lock is released before any channel lock is touched, so registry and channel
+    locks are never nested. Each channel is then read through its nonblocking
+    owner method: a channel busy with its own producer or subscriber work counts
+    as one unavailable channel and the loop keeps summing its siblings.
+    """
+    result = {
+        "available": False,
+        "active": 0,
+        "agent_instances": 0,
+        "subscribers": 0,
+        "offline_buffered_events": 0,
+        "offline_dropped_events": 0,
+        "subscriber_dropped_events": 0,
+        "unavailable_channels": 0,
+    }
+    try:
+        if not STREAMS_LOCK.acquire(blocking=False):
+            return result
+        try:
+            channels = list(STREAMS.values())
+            agent_count = len(AGENT_INSTANCES)
+        finally:
+            STREAMS_LOCK.release()
+        result["available"] = True
+        result["active"] = len(channels)
+        result["agent_instances"] = agent_count
+        for channel in channels:
+            try:
+                snapshot = channel.try_diagnostic_snapshot()
+                if snapshot is None:
+                    result["unavailable_channels"] += 1
+                    continue
+                result["subscribers"] += max(0, int(snapshot.get("subscriber_count", 0)))
+                result["offline_buffered_events"] += max(
+                    0, int(snapshot.get("offline_buffered_events", 0))
+                )
+                result["offline_dropped_events"] += max(
+                    0, int(snapshot.get("offline_dropped_events", 0))
+                )
+                result["subscriber_dropped_events"] += max(
+                    0, int(snapshot.get("subscriber_dropped_events", 0))
+                )
+            except Exception:
+                result["unavailable_channels"] += 1
+    except Exception:
+        # Keep the aggregates already summed from channels that read cleanly; a
+        # late unexpected failure must not discard successful sibling counts.
+        return result
+    return result
+
+
 def _session_payload_with_full_messages(session, *, tool_calls=None):
     """Return compact session metadata plus the embedded full transcript.
 
@@ -96,6 +156,29 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     attach_todo_state(raw, messages)
     if tool_calls is not None:
         raw['tool_calls'] = tool_calls
+    try:
+        from api.session_ops import (
+            regeneration_authority,
+            regeneration_state,
+        )
+        canonical_messages, canonical_context = regeneration_state(session)
+        revision = regeneration_authority(
+            session,
+            rows=canonical_messages,
+            context=canonical_context,
+            full_transcript=True,
+            canonical_state=(canonical_messages, canonical_context),
+        )
+        if revision:
+            messages = list(canonical_messages)
+            raw['messages'] = messages
+            raw['message_count'] = len(messages)
+            attach_todo_state(raw, messages)
+            raw['regeneration_revision'] = revision
+        else:
+            raw.pop('regeneration_revision', None)
+    except Exception:
+        raw.pop('regeneration_revision', None)
     return raw
 
 
@@ -127,6 +210,13 @@ def _redacted_session_payload_with_full_messages(session, *, tool_calls=None) ->
     except Exception:
         logger.debug("Failed to build redacted session payload", exc_info=True)
         return None
+
+
+def _ephemeral_session_payload(session_id: str, messages) -> dict:
+    """Project the non-persistent ``/btw`` terminal session for public SSE."""
+    return redact_session_data(
+        {'session_id': session_id, 'messages': messages if isinstance(messages, list) else []}
+    )
 
 
 def _cancel_event_payload(
@@ -294,6 +384,19 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
         dynamic_schema_overrides=entry.dynamic_schema_overrides,
     )
     _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
+
+
+def _supports_kwarg(func, kwarg_name: str) -> bool:
+    """Return True if callable `func` accepts `kwarg_name` (explicitly or via **kwargs)."""
+    try:
+        sig = inspect.signature(func)
+        for param in sig.parameters.values():
+            if param.kind == param.VAR_KEYWORD or param.name == kwarg_name:
+                return True
+        return False
+    except Exception:
+        return True
+
 
 
 _PERSISTENT_MEMORY_FILES = (
@@ -1450,12 +1553,29 @@ def _clean_synthetic_control_messages_with_provenance(messages):
 def _active_turn_authority(session, stream_id, msg_text):
     """Capture the stream-owned pending turn before settlement mutates it."""
     pending_text = getattr(session, 'pending_user_message', None)
+    token = build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None))
+    checkpoint = (
+        next(
+            (
+                copy.deepcopy(message)
+                for message in reversed(list(getattr(session, 'messages', None) or []))
+                if isinstance(message, dict)
+                and message.get('role') == 'user'
+                and message.get('_active_turn_token') == token
+            ),
+            None,
+        )
+        if token
+        else None
+    )
     return {
-        'token': build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None)),
+        'session_id': getattr(session, 'session_id', None),
+        'token': token,
         'text': pending_text if pending_text is not None else msg_text,
         'timestamp': getattr(session, 'pending_started_at', None),
         'source': getattr(session, 'pending_user_source', None) or 'webui',
         'attachments': copy.deepcopy(getattr(session, 'pending_attachments', None) or []),
+        'checkpoint': checkpoint,
         'current_turn_user_idx': None,
         'turn_id': '',
     }
@@ -1548,7 +1668,7 @@ def _mark_active_turn_checkpoint_in_history(messages, identity, msg_text, *, all
     if (
         not isinstance(message, dict)
         or message.get('role') != 'user'
-        or _normalize_user_text(message.get('content')) != _normalize_user_text(expected_text)
+        or _normalize_user_text(_message_text(message.get('content'))) != _normalize_user_text(expected_text)
     ):
         return messages, False
     _mark_active_turn_checkpoint(message, identity)
@@ -1595,19 +1715,24 @@ def _find_active_turn_checkpoint_index(result_messages, previous_context, identi
         if (
             isinstance(message, dict)
             and message.get('role') == 'user'
-            and _normalize_user_text(message.get('content')) == _normalize_user_text(expected_text)
+            and _normalize_user_text(_message_text(message.get('content'))) == _normalize_user_text(expected_text)
         ):
             return idx
     return None
 
 
 def _materialize_active_turn_user(identity, msg_text, source):
-    message = {
-        'role': 'user',
-        'content': identity.get('text') if isinstance(identity, dict) else msg_text,
-    }
+    checkpoint = identity.get('checkpoint') if isinstance(identity, dict) else None
+    message = (
+        copy.deepcopy(checkpoint)
+        if isinstance(checkpoint, dict) and checkpoint.get('role') == 'user'
+        else {
+            'role': 'user',
+            'content': identity.get('text') if isinstance(identity, dict) else msg_text,
+        }
+    )
     if isinstance(identity, dict):
-        if identity.get('timestamp') is not None:
+        if identity.get('timestamp') is not None and message.get('timestamp') is None:
             message['timestamp'] = identity['timestamp']
         if identity.get('attachments'):
             message['attachments'] = copy.deepcopy(identity['attachments'])
@@ -1616,8 +1741,15 @@ def _materialize_active_turn_user(identity, msg_text, source):
             identity.get('source') or source or 'webui',
             active_turn_token=identity.get('token'),
         )
+        if str(identity.get('source') or source or '').strip().lower() == 'fork':
+            child_session_id = identity.get('session_id')
+            if child_session_id:
+                message['_fork_child_turn'] = child_session_id
     else:
-        stamp_message_source(message, source)
+        stamp_message_source(
+            message,
+            source,
+        )
     return message
 
 
@@ -1633,7 +1765,18 @@ def _settle_current_turn_boundary(previous_context, result_messages, identity, m
         msg_text,
     )
     if _checkpoint_idx is not None:
-        _mark_active_turn_checkpoint(result_messages[_checkpoint_idx], identity)
+        existing_checkpoint = result_messages[_checkpoint_idx]
+        if isinstance(identity.get('checkpoint'), dict):
+            retained_checkpoint = _materialize_active_turn_user(identity, msg_text, source)
+            if (
+                retained_checkpoint.get('id') is None
+                and isinstance(existing_checkpoint, dict)
+                and existing_checkpoint.get('id') is not None
+            ):
+                retained_checkpoint['id'] = existing_checkpoint['id']
+            result_messages[_checkpoint_idx] = retained_checkpoint
+        else:
+            _mark_active_turn_checkpoint(existing_checkpoint, identity)
         return result_messages
     previous_context = list(previous_context or [])
     if _messages_have_prefix(result_messages, previous_context):
@@ -1721,6 +1864,24 @@ def _prepare_marker_clean_writeback(
     return [], list(previous_context_messages or []), provenance
 
 
+def _annotate_media_snapshots_for_settled_messages(messages) -> None:
+    """Freeze local-file MEDIA: bytes at settle time so historical previews
+    keep showing the version the turn emitted, even after the file is
+    overwritten in place (#6922 follow-up).
+
+    Runs AFTER the display merge so the annotation rides the exact messages the
+    frontend will render. The store is content-addressed and the annotator is
+    idempotent (already-stored digests short-circuit), so re-settling the same
+    transcript is cheap. Never raises — snapshotting is best-effort durability.
+    """
+    try:
+        from api.media_snapshots import annotate_media_snapshots
+
+        annotate_media_snapshots(messages)
+    except Exception:
+        logger.debug("Media snapshot annotation failed during settle", exc_info=True)
+
+
 def _settle_result_messages(
     session,
     previous_messages,
@@ -1783,6 +1944,7 @@ def _settle_result_messages(
         source=source,
         verification_nudge_provenance=verification_nudge_provenance,
     )
+    _annotate_media_snapshots_for_settled_messages(session.messages)
     _compact_session_image_parts_for_persistence(session)
     _advance_truncation_watermark_after_commit(session)  # #3831
     return result_messages
@@ -4455,6 +4617,12 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
             else:
                 _put_title_status(put_event, session_id, source, llm_status, effective_title, raw_preview)
             put_event('title', {'session_id': session_id, 'title': effective_title})
+            # Sync the generated title to state.db so `hermes sessions list` shows it.
+            try:
+                from api.state_sync import sync_session_title
+                sync_session_title(session_id, effective_title, profile=getattr(s, 'profile', None) or 'default')
+            except Exception:
+                logger.debug("Failed to sync title to state.db after generation for %s", session_id)
         else:
             _put_title_status(put_event, session_id, 'skipped', source or 'unchanged', effective_title, raw_preview)
     finally:
@@ -4527,6 +4695,12 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
             s.save(touch_updated_at=False)
         _put_title_status(put_event, session_id, 'refreshed', llm_status, effective_title, raw_preview)
         put_event('title', {'session_id': session_id, 'title': effective_title})
+        # Sync the refreshed title to state.db so `hermes sessions list` stays current.
+        try:
+            from api.state_sync import sync_session_title
+            sync_session_title(session_id, effective_title, profile=getattr(s, 'profile', None) or 'default')
+        except Exception:
+            logger.debug("Failed to sync refreshed title to state.db for %s", session_id)
         logger.info("Adaptive title refresh: session=%s new_title=%r", session_id, effective_title)
     except Exception:
         logger.debug("Background title refresh failed for session %s", session_id, exc_info=True)
@@ -4975,6 +5149,7 @@ def _sanitize_messages_for_api(
     effective_model: str | None = None,
     effective_provider: str | None = None,
     effective_base_url: str | None = None,
+    preserve_api_content: bool = False,
     requested_provider: str = "",
 ):
     """Return a deep copy of messages with only API-safe fields.
@@ -4995,7 +5170,18 @@ def _sanitize_messages_for_api(
     remaining replay gap where an older native image in the saved transcript kept
     causing 400s on every later text-only turn (#2297).
     """
-    strip_native_images = cfg is not None and _resolve_image_input_mode(cfg, effective_provider or "", effective_model or "", requested_provider=requested_provider) == "text"
+    strip_native_images = cfg is not None and _resolve_image_input_mode(
+        cfg,
+        effective_provider or "",
+        effective_model or "",
+        requested_provider=requested_provider,
+    ) == "text"
+    allowed_keys = _API_SAFE_MSG_KEYS
+    if preserve_api_content:
+        # ``api_content`` is an internal Agent replay sidecar.  It is opt-in
+        # here because direct provider/compression projections must continue to
+        # reject unknown bookkeeping fields.
+        allowed_keys = _API_SAFE_MSG_KEYS | {"api_content"}
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
     valid_tool_call_ids: set = set()
@@ -5041,7 +5227,16 @@ def _sanitize_messages_for_api(
             if not tid or tid not in valid_tool_call_ids:
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
-        sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        sanitized = {k: v for k, v in msg.items() if k in allowed_keys}
+        sanitized = scrub_internal_replay_fields(
+            [sanitized],
+            preserve_message_api_content=preserve_api_content,
+            message_records=True,
+        )[0]
+        if sanitized.get("role") not in {"user", "assistant"}:
+            sanitized.pop("api_content", None)
+        elif not isinstance(sanitized.get("api_content"), str) or not sanitized.get("api_content"):
+            sanitized.pop("api_content", None)
         # Drop empty tool_calls — strict providers (DeepSeek, newer OpenAI)
         # reject tool_calls: [] with HTTP 400 even when no orphaned calls exist.
         if 'tool_calls' in sanitized and not sanitized['tool_calls']:
@@ -5125,6 +5320,33 @@ def _sanitize_messages_for_api(
     return final
 
 
+def _sanitize_messages_for_agent(
+    messages,
+    *,
+    cfg: dict = None,
+    effective_model: str | None = None,
+    effective_provider: str | None = None,
+    effective_base_url: str | None = None,
+    requested_provider: str = "",
+):
+    """Build the internal Agent replay projection with ``api_content`` intact.
+
+    ``api_content`` is a durable provider-facing sidecar, not a direct-provider
+    payload field.  Keep this opt-in at one named boundary so every Agent
+    history call uses the same contract while ordinary API/compression callers
+    continue to use the default-stripping sanitizer.
+    """
+    return _sanitize_messages_for_api(
+        messages,
+        cfg=cfg,
+        effective_model=effective_model,
+        effective_provider=effective_provider,
+        effective_base_url=effective_base_url,
+        preserve_api_content=True,
+        requested_provider=requested_provider,
+    )
+
+
 def _api_safe_message_positions(messages):
     """Return [(original_index, sanitized_message)] for API-safe messages."""
     valid_tool_call_ids: set = set()
@@ -5157,6 +5379,10 @@ def _api_safe_message_positions(messages):
             if not tid or tid not in valid_tool_call_ids:
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        sanitized = scrub_internal_replay_fields(
+            [sanitized],
+            message_records=True,
+        )[0]
         if 'tool_calls' in sanitized and not sanitized['tool_calls']:
             del sanitized['tool_calls']
         if is_recovered:
@@ -5241,7 +5467,11 @@ def _deduplicate_context_messages(messages):
         if _is_compressed_context_tool_result_summary_message(msg) and not msg.get('tool_call_id'):
             deduped.append(msg)
             continue
-        key = _message_identity(msg)
+        # Context ownership is provider-facing: two rows with identical visible
+        # text but different durable ``api_content`` sidecars are distinct turns.
+        # Keep the display identity unchanged so ordinary transcript dedup still
+        # collapses the same visible row.
+        key = _message_replay_key(msg)
         if isinstance(msg, dict) and msg.get('role') == 'user' and key is not None:
             user_exact_key = (
                 key,
@@ -5620,11 +5850,12 @@ def _message_identity(msg):
     )
 
 
-def _messages_have_prefix(messages, prefix):
+def _messages_have_prefix(messages, prefix, *, key_fn=None):
+    key_fn = key_fn or _message_identity
     if len(messages or []) < len(prefix or []):
         return False
     for idx, expected in enumerate(prefix or []):
-        if _message_identity((messages or [])[idx]) != _message_identity(expected):
+        if key_fn((messages or [])[idx]) != key_fn(expected):
             return False
     return True
 
@@ -5632,16 +5863,30 @@ def _messages_have_prefix(messages, prefix):
 def _message_replay_key(msg):
     """Return a stable comparison key for replay/overlap de-duplication."""
     identity = _message_identity(msg)
+    # ``api_content`` is a provider-facing replay sidecar.  It must participate
+    # in context/replay overlap identity or two same-visible turns can collapse
+    # before the Agent sees the original wire bytes.  Keep synthetic/adjacent
+    # partial collapse on the existing identity path; partial rows are display
+    # bookkeeping rather than durable provider turns.
+    raw_sidecar = (
+        msg.get("api_content")
+        if isinstance(msg, dict) and not msg.get("_partial")
+        else None
+    )
+    sidecar = raw_sidecar if isinstance(raw_sidecar, str) and raw_sidecar else None
     if identity is not None:
+        if sidecar is not None:
+            return (*identity, sidecar)
         return identity
     if not isinstance(msg, dict):
         return None
-    return (
+    key = (
         str(msg.get('role') or ''),
         _message_text(msg.get('content', '')),
         str(msg.get('tool_call_id') or ''),
         json.dumps(msg.get('tool_calls') or [], sort_keys=True, ensure_ascii=False),
     )
+    return (*key, sidecar) if sidecar is not None else key
 
 
 def _strip_replayed_prefix(existing_messages, candidates):
@@ -5673,6 +5918,20 @@ def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
     if not isinstance(previous_msg, dict) or not isinstance(candidate_msg, dict):
         return False
     if previous_msg.get('role') != candidate_msg.get('role'):
+        return False
+    previous_api_content = previous_msg.get("api_content")
+    candidate_api_content = candidate_msg.get("api_content")
+    normalized_previous_api_content = (
+        " ".join(previous_api_content.split())
+        if isinstance(previous_api_content, str) and previous_api_content
+        else None
+    )
+    normalized_candidate_api_content = (
+        " ".join(candidate_api_content.split())
+        if isinstance(candidate_api_content, str) and candidate_api_content
+        else None
+    )
+    if normalized_previous_api_content != normalized_candidate_api_content:
         return False
     previous_text = " ".join(_message_text(previous_msg.get('content', '')).split())
     candidate_text = " ".join(_message_text(candidate_msg.get('content', '')).split())
@@ -5730,7 +5989,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
     if not previous_context or not result_messages:
         return result_messages
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
-    if not _messages_have_prefix(result_messages, previous_context):
+    if not _messages_have_prefix(
+        result_messages,
+        previous_context,
+        key_fn=_message_replay_key,
+    ):
         # Agent-side role-sequence repair can replace the last prior user row
         # with a repaired current-user row. In that shape the result no longer
         # has `previous_context` as an exact prefix, but it should still be
@@ -5739,7 +6002,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
             msg_text
             and len(previous_context) >= 1
             and len(result_messages) >= len(previous_context)
-            and _messages_have_prefix(result_messages, previous_context[:-1])
+            and _messages_have_prefix(
+                result_messages,
+                previous_context[:-1],
+                key_fn=_message_replay_key,
+            )
         ):
             boundary_idx = len(previous_context) - 1
             boundary_row = result_messages[boundary_idx]
@@ -5758,6 +6025,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
                     # history in previous_context untouched.
                     cleaned_boundary = copy.deepcopy(boundary_row)
                     cleaned_boundary['content'] = msg_text
+                    # The stale row's provider-facing payload describes the
+                    # discarded prefix + current turn, not the rewritten
+                    # visible turn.  Do not let those obsolete bytes survive
+                    # into Agent context.
+                    cleaned_boundary.pop('api_content', None)
                     candidates = [cleaned_boundary] + result_messages[boundary_idx + 1:]
                 else:
                     candidates = result_messages[boundary_idx:]
@@ -6099,6 +6371,10 @@ def _strip_stale_user_merge_from_messages(
         ):
             cleaned = copy.deepcopy(msg) if isinstance(msg, dict) else {'role': 'user', 'content': msg_text}
             cleaned['content'] = msg_text
+            # The stale row's provider-facing payload describes the discarded
+            # merged prefix, so it is invalid once the visible content is
+            # rewritten to the submitted turn.
+            cleaned.pop('api_content', None)
             out.append(cleaned)
         else:
             out.append(msg)
@@ -7166,7 +7442,7 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         except (TypeError, ValueError):
             return False
         return (
-            _normalize_user_text(existing.get('content')) == _normalize_user_text(pending_text)
+            _normalize_user_text(_message_text(existing.get('content'))) == _normalize_user_text(pending_text)
             and existing_ts == recovered_ts
             and existing_source == pending_source
             and list(existing.get('attachments') or []) == pending_attachments
@@ -7180,6 +7456,8 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         'timestamp': recovered_ts,
         '_recovered': True,
     }
+    if str(pending_source or '').strip().lower() == 'fork':
+        recovered['_fork_child_turn'] = session.session_id
     stamp_message_source(recovered, pending_source)
     if pending_attachments:
         recovered['attachments'] = pending_attachments
@@ -8519,22 +8797,27 @@ def _run_agent_streaming(
         try:
             try:
                 from api.route_approvals import (
-                    submit_gateway_pending_mirror as _submit_pending_for_polling,
+                    settle_gateway_pending_local_notification as _settle_pending_for_polling,
                     retire_gateway_pending_mirror as _retire_gateway_pending_mirror,
                 )
                 def _cleanup_gateway_pending_mirror():
                     _retire_gateway_pending_mirror(session_id)
             except ImportError:
-                _submit_pending_for_polling = None
+                _settle_pending_for_polling = None
                 _cleanup_gateway_pending_mirror = None
             from tools.approval import (
                 register_gateway_notify as _reg_notify,
                 unregister_gateway_notify as _unreg_notify,
             )
             def _approval_notify_cb(approval_data):
-                if _submit_pending_for_polling is not None:
+                if _settle_pending_for_polling is not None:
                     try:
-                        head, total = _submit_pending_for_polling(session_id, approval_data)
+                        auto_resolved, head, total = _settle_pending_for_polling(
+                            session_id,
+                            approval_data,
+                        )
+                        if auto_resolved and head is None:
+                            return
                         approval_data = {**(head or approval_data), "pending_count": total}
                     except Exception:
                         logger.warning("Failed to mirror approval into WebUI polling state", exc_info=True)
@@ -9446,6 +9729,12 @@ def _run_agent_streaming(
                     # field the cached agent silently retains the previous
                     # profile's SOUL.md (and any other profile-scoped context).
                     _profile_home or '',
+                    # Terminal backend identity: sessions switching between
+                    # remote (SSH) and local backends must not reuse a cached
+                    # agent that carries stale terminal env vars (#5937).
+                    _safe_profile_runtime_env.get('TERMINAL_ENV', '') or '',
+                    _safe_profile_runtime_env.get('TERMINAL_SSH_HOST', '') or '',
+                    _safe_profile_runtime_env.get('TERMINAL_SSH_USER', '') or '',
                 ], sort_keys=True)
                 _agent_sig = _hashlib.sha256(_sig_blob.encode()).hexdigest()[:16]
 
@@ -9761,7 +10050,7 @@ def _run_agent_streaming(
             _run_conversation_kwargs = dict(
                 user_message=user_message,
                 system_message=workspace_system_msg,
-                conversation_history=_sanitize_messages_for_api(
+                conversation_history=_sanitize_messages_for_agent(
                     _previous_context_messages,
                     cfg=_cfg,
                     effective_model=resolved_model,
@@ -9771,8 +10060,9 @@ def _run_agent_streaming(
                 ),
                 task_id=session_id,
                 persist_user_message=msg_text,
-                persist_user_timestamp=getattr(s, 'pending_started_at', None),
             )
+            if _supports_kwarg(agent.run_conversation, 'persist_user_timestamp'):
+                _run_conversation_kwargs['persist_user_timestamp'] = getattr(s, 'pending_started_at', None)
             # Only pass moa_config when a /moa override is actually active, so a
             # normal send never trips a TypeError on an older hermes-agent whose
             # run_conversation() predates the moa_config kwarg.
@@ -9852,8 +10142,15 @@ def _run_agent_streaming(
                     if isinstance(_m, dict) and _m.get('role') == 'assistant':
                         _answer = str(_m.get('content', ''))
                         break
+                # /btw is intentionally non-persistent, but its terminal SSE
+                # payload is still public output.  Project the ephemeral
+                # session before enqueueing it so raw Agent ``api_content`` or
+                # provenance aliases cannot cross the wire.
+                _ephemeral_session = _ephemeral_session_payload(
+                    session_id, result.get('messages', [])
+                )
                 put('done', {
-                    'session': {'session_id': session_id, 'messages': result.get('messages', [])},
+                    'session': _ephemeral_session,
                     'usage': {'input_tokens': 0, 'output_tokens': 0},
                     'ephemeral': True,
                     'answer': _answer,
@@ -10257,7 +10554,7 @@ def _run_agent_streaming(
                                 _heal_kwargs = dict(
                                     user_message=user_message,
                                     system_message=workspace_system_msg,
-                                    conversation_history=_sanitize_messages_for_api(
+                                    conversation_history=_sanitize_messages_for_agent(
                                         _previous_context_messages,
                                         cfg=_cfg,
                                         effective_model=resolved_model,
@@ -10267,8 +10564,9 @@ def _run_agent_streaming(
                                     ),
                                     task_id=session_id,
                                     persist_user_message=msg_text,
-                                    persist_user_timestamp=getattr(s, 'pending_started_at', None),
                                 )
+                                if _supports_kwarg(agent.run_conversation, 'persist_user_timestamp'):
+                                    _heal_kwargs['persist_user_timestamp'] = getattr(s, 'pending_started_at', None)
                                 if moa_config is not None:
                                     _heal_kwargs["moa_config"] = moa_config
                                 _heal_result = agent.run_conversation(**_heal_kwargs)
@@ -11497,7 +11795,7 @@ def _run_agent_streaming(
                         _heal_kwargs2 = dict(
                             user_message=user_message,
                             system_message=workspace_system_msg,
-                            conversation_history=_sanitize_messages_for_api(
+                            conversation_history=_sanitize_messages_for_agent(
                                 _previous_context_messages,
                                 cfg=_cfg,
                                 effective_model=resolved_model,
@@ -11507,8 +11805,9 @@ def _run_agent_streaming(
                             ),
                             task_id=session_id,
                             persist_user_message=msg_text,
-                            persist_user_timestamp=getattr(s, 'pending_started_at', None),
                         )
+                        if _supports_kwarg(_heal_agent.run_conversation, 'persist_user_timestamp'):
+                            _heal_kwargs2['persist_user_timestamp'] = getattr(s, 'pending_started_at', None)
                         if moa_config is not None:
                             _heal_kwargs2["moa_config"] = moa_config
                         _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)
