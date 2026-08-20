@@ -204,6 +204,33 @@ def _sync(dry_run: bool) -> tuple[int, dict]:
     return 200, payload
 
 
+def _upstream_fetched_at() -> str:
+    """When the upstream tracking ref was last updated, ISO-8601, or "".
+
+    Read from the ref's reflog rather than its commit date: the commit date says
+    when upstream authored the tip, not when this machine learned about it, and
+    those differ by exactly the staleness worth reporting. A packed ref has no
+    mtime to stat, so the reflog is also the portable answer.
+    """
+    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    repo = home / "hermes-agent"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "reflog", "show", "upstream/main",
+             "-n", "1", "--date=iso-strict", "--format=%gd"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    # "refs/remotes/upstream/main@{2026-08-20T00:58:48-03:00}"
+    line = (proc.stdout or "").strip()
+    if "@{" not in line or not line.endswith("}"):
+        return ""
+    return line[line.index("@{") + 2 : -1]
+
+
 def _state_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "cron" / "state"
 
@@ -354,6 +381,9 @@ def _overview() -> tuple[int, dict]:
     payload = {
         "status": status,
         "status_code": code,
+        # Not inside "status": that dict is what sync-fork returned, and this is
+        # about how old its inputs were.
+        "upstream_fetched_at": _upstream_fetched_at(),
         "sync": sync,
         "prs": prs,
         "history": history,
