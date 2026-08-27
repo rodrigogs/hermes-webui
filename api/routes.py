@@ -280,7 +280,16 @@ _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
 _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
 _CLIENT_EVENT_RATE_LIMIT_MAX = 30
 _CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024
-_EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 512 * 1024
+# O proxy BUFERIZA a resposta do sidecar em memoria antes de repassar, então o teto
+# existe para um sidecar nao afogar o processo do WebUI. Ele NAO pode, porém, ser
+# menor que a maior resposta legitima: em 2026-08-27 o console do hermes-smart-router
+# passou de 492 KB para 593.144 bytes com as features novas e estourou o teto de
+# 512 KiB, e o painel do operador exibiu "Could not reach the router sidecar
+# (HTTP 502)" com o sidecar saudavel do outro lado (/console respondia 200 em 1,8 ms
+# em localhost). 1 MiB da ~70% de folga sobre a medicao de hoje e mantem o limite
+# sendo um limite. Um console que chegar perto disto e sinal de que a tela precisa
+# emagrecer, nao de que o teto precisa subir de novo.
+_EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 1024 * 1024
 _CLIENT_EVENT_ALLOWED_FIELDS = {
     "event": 64,
     "source": 80,
