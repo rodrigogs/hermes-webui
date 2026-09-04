@@ -3759,6 +3759,26 @@ def _message_text(value) -> str:
     return _strip_thinking_markup(str(value or '').strip())
 
 
+def _message_has_nontext_content(value) -> bool:
+    """True when content[] carries a part that is not text -- an image, a file, an attachment.
+
+    `_message_text` returns '' for those, correctly: they hold no text. But "no text" and "no
+    message" are different things, and the title generator used to conflate them. A user message
+    that is just a pasted screenshot is a real turn with real substance; treating it as absent is
+    what made title regeneration fail with `empty_user_message` on a conversation that plainly had
+    user messages in it.
+    """
+    if not isinstance(value, list):
+        return False
+    for part in value:
+        if not isinstance(part, dict):
+            continue
+        ptype = str(part.get('type') or '').lower()
+        if ptype and ptype not in ('text', 'input_text', 'output_text'):
+            return True
+    return False
+
+
 def _assistant_content_part_is_tool_use(part) -> bool:
     """Return True when a content[] part represents a tool invocation boundary."""
     if not isinstance(part, dict):
@@ -3849,18 +3869,27 @@ def _first_exchange_snippets(messages):
     """
     user_text = ''
     asst_text = ''
+    # Seen, not "had text". An opening turn can be a bare screenshot: no text, still a turn. Gating
+    # the assistant scan on user TEXT meant such a conversation produced ('', '') and the caller
+    # reported `empty_user_message`.
+    user_seen = False
     for m in messages or []:
         if not isinstance(m, dict):
             continue
         role = m.get('role')
         if role == 'user':
             candidate = _message_text(m.get('content'))
-            if not user_text and candidate:
+            if not user_seen:
+                # A message with neither text nor media is a placeholder (the resume path writes
+                # empty-text user events); skip it and keep looking for the real opener.
+                if not candidate and not _message_has_nontext_content(m.get('content')):
+                    continue
+                user_seen = True
                 user_text = candidate
                 continue
-            if user_text and candidate:
-                break
-        elif role == 'assistant' and user_text:
+            # A second real user message ends the first exchange.
+            break
+        elif role == 'assistant' and user_seen:
             candidate = _message_text(m.get('content'))
             # Skip tool-call preambles *only* when content is empty or looks
             # like meta-reasoning ("Let me check my memory first.", "The user
@@ -3871,7 +3900,7 @@ def _first_exchange_snippets(messages):
                 continue
             if candidate:
                 asst_text = candidate
-        if user_text and asst_text:
+        if user_seen and asst_text:
             break
     return user_text[:500], asst_text[:500]
 
@@ -4866,7 +4895,10 @@ def generate_session_title_for_session(session, *, prefer_latest: bool = False, 
         user_text, assistant_text = _latest_exchange_snippets(messages)
     else:
         user_text, assistant_text = _first_exchange_snippets(messages)
-    if not user_text:
+    # Both, not just the user side. An image-only opener has no user text and a perfectly good
+    # assistant answer describing it, and that answer is what the title should come from. Only a
+    # session with nothing on either side is untitleable.
+    if not user_text and not assistant_text:
         return None, 'empty_user_message', ''
     from api import profiles as profiles_api
 
