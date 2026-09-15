@@ -1744,7 +1744,16 @@ class Session:
                     existing_text = self.path.read_text(encoding='utf-8')
                     try:
                         existing = json.loads(existing_text)
-                        existing_msg_count = len(existing.get('messages') or [])
+                        # A segmented head's `messages` is only the TAIL -- the
+                        # sealed chunks hold the rest. Adding _sealed_total back
+                        # in is what makes this a TOTAL again, matching the
+                        # cached fast-path's `_disk_msg_count` (always a total)
+                        # and the #1558 guard's actual contract. Unsegmented
+                        # heads have no `message_chunks`, and _sealed_total
+                        # tolerates that (and any malformed manifest) by
+                        # returning 0, so this is a no-op for them.
+                        existing_msg_count = (len(existing.get('messages') or []) +
+                                               _sealed_total(existing.get('message_chunks')))
                     except (json.JSONDecodeError, ValueError):
                         existing_msg_count = -1  # corrupt → always back up
                 incoming_msg_count = len(self.messages or [])

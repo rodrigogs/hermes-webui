@@ -143,3 +143,58 @@ def test_manifest_sits_inside_the_cheap_metadata_prefix(session_store):
     prefix = M._read_metadata_json_prefix(session_store / "w10.json")
     assert prefix is not None
     assert json.loads(prefix)["message_count"] == 25
+
+
+# ── #1558 shrink-backup guard must count SEALED + tail, not just the tail ───
+
+def test_shrink_through_a_fresh_object_after_segmenting_backs_up_the_pre_shrink_total(session_store):
+    """Regression: a fresh Session object (no remembered on-disk identity)
+    takes save()'s slow fallback path, which used to read only the head's
+    `messages` (the tail) to learn the existing count. Against a segmented
+    head that undercounts the total, so a genuine shrink read as a grow and
+    the #1558 guard silently stopped backing anything up."""
+    s = _sess(session_store, "w11", _msgs(0, 30))
+    s.save()
+    doc_before = json.loads((session_store / "w11.json").read_bytes())
+    assert M._sealed_total(doc_before["message_chunks"]) == 26
+    assert len(doc_before["messages"]) == 4
+    # A fresh object has no _disk_identity_seen, forcing the slow fallback.
+    # 4 messages stays at the tail-keep boundary (not > _SIDECAR_TAIL_KEEP), so
+    # this save does not itself reseal -- isolating the count fix from
+    # unrelated chunk-overwrite behaviour.
+    fresh = _sess(session_store, "w11", _msgs(0, 4))  # genuine shrink: 4 < 30
+    fresh.save()
+    bak_path = session_store / "w11.json.bak"
+    assert bak_path.exists(), "a shrink behind a segmented head must still be backed up"
+    bak_doc = json.loads(bak_path.read_bytes())
+    assert M._sealed_total(bak_doc.get("message_chunks")) + len(bak_doc["messages"]) == 30, \
+        "the .bak must describe the pre-shrink TOTAL (sealed + tail), not just the tail"
+    live_doc = json.loads((session_store / "w11.json").read_bytes())
+    assert len(live_doc["messages"]) == 4
+
+
+def test_grow_through_a_fresh_object_after_segmenting_produces_no_backup(session_store):
+    """The other direction: a grow behind a segmented head must stay
+    backup-free, or every save on a segmented session would start writing
+    backups."""
+    s = _sess(session_store, "w12", _msgs(0, 30))
+    s.save()
+    fresh = _sess(session_store, "w12", _msgs(0, 31))  # grow: 31 > 30
+    fresh.save()
+    assert not (session_store / "w12.json.bak").exists(), \
+        "a grow behind a segmented head must not produce a backup"
+
+
+def test_unsegmented_shrink_through_a_fresh_object_is_unaffected(session_store):
+    """Guard against over-fixing: an unsegmented head's fallback count must
+    stay exactly `len(messages)`, unaffected by the sealed-total addition."""
+    s = _sess(session_store, "w13", _msgs(0, 5))  # below every threshold; never segments
+    s.save()
+    doc = json.loads((session_store / "w13.json").read_bytes())
+    assert "message_chunks" not in doc or not doc["message_chunks"]
+    fresh = _sess(session_store, "w13", _msgs(0, 2))  # shrink: 2 < 5
+    fresh.save()
+    bak_path = session_store / "w13.json.bak"
+    assert bak_path.exists()
+    bak_doc = json.loads(bak_path.read_bytes())
+    assert len(bak_doc["messages"]) == 5, "unsegmented fallback must still count messages directly"
