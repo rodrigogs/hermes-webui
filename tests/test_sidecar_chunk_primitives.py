@@ -46,9 +46,17 @@ def test_sha256_hex_matches_hashlib():
     assert M._sha256_hex(b"hello") == hashlib.sha256(b"hello").hexdigest()
 
 
-def test_structural_key_uses_role_ts_and_content_length():
-    msg = {"role": "assistant", "ts": 1234.5, "content": "abcde"}
-    assert M._structural_key(msg) == ("assistant", 1234.5, 5)
+def test_structural_key_uses_role_timestamp_and_content_length():
+    # `timestamp` is the spelling every message producer in this repo writes, so
+    # it is the one that must be read; `ts` is only a fallback for fixtures.
+    assert M._structural_key(
+        {"role": "assistant", "timestamp": 1234.5, "content": "abcde"}
+    ) == ("assistant", 1234.5, 5)
+    assert M._structural_key({"role": "assistant", "ts": 1234.5, "content": "abcde"}) == (
+        "assistant", 1234.5, 5)
+    assert M._structural_key(
+        {"role": "user", "timestamp": 9.0, "ts": 1.0, "content": "ab"}
+    ) == ("user", 9.0, 2), "timestamp wins when a message somehow carries both"
     # Tolerates absent fields rather than raising: a malformed message must not
     # crash a save, it must only fail to match.
     assert M._structural_key({}) == (None, None, 0)

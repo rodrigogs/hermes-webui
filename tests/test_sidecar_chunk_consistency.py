@@ -27,6 +27,30 @@ def _msgs(start, n):
     return [{"role": "user", "ts": float(i), "content": f"m{i}"} for i in range(start, start + n)]
 
 
+def _real_msgs(start, n):
+    """The shape every producer in this repo actually writes.
+
+    `timestamp`, never `ts`, plus the other keys a real assistant turn carries.
+    A 135,634-message production session has 0 messages with `ts` and 20,000 of
+    20,000 sampled with `timestamp`, so a fixture that synthesises `ts` cannot
+    tell whether the structural key's timestamp field is live or dead.
+    """
+    return [{"role": "assistant", "content": f"body {i:04d}",
+             "timestamp": 1757000000.0 + i, "reasoning": "", "id": f"msg-{i}"}
+            for i in range(start, start + n)]
+
+
+def _assert_bak_holds_total(session_store, sid, total):
+    """The #1558 backup exists and describes the PRE-shrink transcript."""
+    bak = session_store / f"{sid}.json.bak"
+    assert bak.exists(), f"a shrinking save must leave {sid}.json.bak"
+    doc = json.loads(bak.read_bytes())
+    assert doc["message_count"] == total
+    assert len(doc["messages"]) + M._sealed_total(doc.get("message_chunks")) == total, \
+        "the .bak must describe the pre-shrink total, tail plus sealed chunks"
+    return doc
+
+
 def _segmented(session_store, sid, n=22):
     s = M.Session(session_id=sid, title="T", workspace=str(session_store.parent),
                   model="glm", messages=_msgs(0, n))
@@ -54,6 +78,9 @@ def test_truncating_into_sealed_territory_reseals_from_memory(session_store):
     doc = json.loads((session_store / "k2.json").read_bytes())
     assert M._sealed_total(doc.get("message_chunks")) + len(doc["messages"]) == 8
     assert [m["content"] for m in M.Session.load("k2").messages] == [f"m{i}" for i in range(8)]
+    # A shrink on the re-seal path is still a shrink: #1558's backup must hold
+    # the PRE-shrink transcript, or the 22 dropped messages are unrecoverable.
+    _assert_bak_holds_total(session_store, "k2", 30)
 
 
 def test_rewriting_a_sealed_message_reseals_from_memory(session_store):
@@ -84,6 +111,12 @@ def test_clearing_all_messages_leaves_a_consistent_head(session_store):
     assert doc["message_count"] == 0
     assert not doc.get("message_chunks")
     assert M.Session.load("k5").messages == []
+    # Clearing is the largest shrink there is, so it is the case where the
+    # backup matters most: the .bak must still describe all 30.
+    bak_doc = _assert_bak_holds_total(session_store, "k5", 30)
+    named = {e["file"] for e in bak_doc.get("message_chunks") or []}
+    assert all((session_store / "k5.msgs" / f).exists() for f in named), \
+        "the .bak's chunks must still be on disk for it to be worth anything"
 
 
 def test_manifest_matches_memory_detects_each_divergence():
@@ -100,6 +133,58 @@ def test_manifest_matches_memory_detects_each_divergence():
     edited2[3] = {"role": "assistant", "ts": 3.0, "content": "m3"}
     assert M._manifest_matches_memory(manifest, edited2) is False, "last key changed"
     assert M._manifest_matches_memory([], msgs) is True, "no manifest, nothing to contradict"
+
+
+def test_structural_key_reads_the_timestamp_field_real_messages_carry():
+    """The middle field must come from `timestamp`, not only from `ts`.
+
+    Keying on `ts` alone made it None for every production message, silently
+    reducing the key to (role, len(content)) -- so a same-role, same-length
+    replacement read as identical.
+    """
+    real = _real_msgs(7, 1)[0]
+    assert "ts" not in real, "the fixture must not paper over the real shape"
+    assert M._structural_key(real)[1] == real["timestamp"]
+    # ...and the short spelling still works, so synthetic fixtures keep keying.
+    assert M._structural_key({"role": "user", "ts": 3.0, "content": "abc"})[1] == 3.0
+    # A different message with the same role and the same content LENGTH must
+    # not share a key. This is the comparison that was dead in production.
+    other = dict(real, content="x" * len(real["content"]), timestamp=real["timestamp"] + 1)
+    assert M._structural_key(real) != M._structural_key(other)
+    assert M._structural_key(real)[2] == M._structural_key(other)[2], "same length, on purpose"
+
+
+def test_a_same_length_boundary_edit_is_detected_on_the_real_message_shape(session_store):
+    """A rewrite that changes neither role nor length must still be caught.
+
+    Uses `_real_msgs` (timestamp, no ts) because that is where the old key went
+    blind: with `ts` absent, replacing a sealed boundary message with a
+    different one of the same role and length produced an identical key, so the
+    manifest was believed and the reload served the stale sealed message.
+    """
+    s = M.Session(session_id="k10", title="T", workspace=str(session_store.parent),
+                  model="glm", messages=_real_msgs(0, 30))
+    s.save()
+    loaded = M.Session.load("k10")
+    sealed = M._sealed_total(loaded._message_chunks)
+    assert sealed == 26
+
+    boundary = sealed - 1  # the LAST sealed message: keyed, so this is checkable
+    old = loaded.messages[boundary]
+    replacement = dict(old, content="z" * len(old["content"]),
+                       timestamp=old["timestamp"] + 0.5, id="rewritten")
+    assert len(replacement["content"]) == len(old["content"])
+    assert replacement["role"] == old["role"]
+    loaded.messages[boundary] = replacement
+    assert M._manifest_matches_memory(loaded._message_chunks, loaded.messages) is False
+
+    loaded.save()
+
+    reloaded = M.Session.load("k10")
+    assert len(reloaded.messages) == 30
+    assert reloaded.messages[boundary]["id"] == "rewritten", \
+        "the reload must serve the edit, not the stale sealed message"
+    assert reloaded.messages[boundary]["content"] == replacement["content"]
 
 
 def test_a_transient_chunk_read_error_cannot_become_permanent_loss(session_store):
@@ -173,14 +258,27 @@ def test_collapse_on_load_reseals_and_still_backs_up_the_head(session_store):
            "reasoning": "same reasoning",
            "_partial_tool_calls": [{"name": "execute_code", "args": {"code": "x"},
                                     "done": True, "is_error": True, "duration": 1.0}]}
+    # The duplicates sit INSIDE what will be sealed (21 messages, KEEP=4 => the
+    # first 17 are sealed), so collapsing them shifts the sealed prefix and the
+    # re-seal half of this test is genuinely exercised. With them in the tail
+    # the sealed prefix survives untouched and no re-seal happens at all.
     s = M.Session(session_id="k6", title="T", workspace=str(session_store.parent),
-                  model="glm", messages=_msgs(0, 18) + [dup, dict(dup), dict(dup)])
+                  model="glm", messages=_msgs(0, 5) + [dup, dict(dup), dict(dup)] + _msgs(5, 13))
     s.save()
-    assert json.loads((session_store / "k6.json").read_bytes())["message_chunks"]
+    before = json.loads((session_store / "k6.json").read_bytes())
+    assert [e["file"] for e in before["message_chunks"]] == ["000001.json"]
 
     loaded = M.Session.load("k6")
 
     assert sum(1 for m in loaded.messages if m.get("_partial")) == 1
+    assert len(loaded.messages) == 19
     assert (session_store / "k6.json.bak").exists(), "a shrinking save must back the head up"
+    _assert_bak_holds_total(session_store, "k6", 21)
+    after = json.loads((session_store / "k6.json").read_bytes())
+    assert [e["file"] for e in after["message_chunks"]] == ["000002.json"], \
+        "the shifted prefix must have been re-sealed into a NEW chunk"
+    assert (session_store / "k6.msgs" / "000001.json").exists(), "and the old one left alone"
+    assert after["message_count"] == 19
     again = M.Session.load("k6")
     assert len(again.messages) == len(loaded.messages)
+    assert [m.get("content") for m in again.messages] == [m.get("content") for m in loaded.messages]

@@ -4594,16 +4594,32 @@ def _sha256_hex(data: bytes) -> str:
 
 
 def _structural_key(msg):
-    """A cheap identity for one message: (role, ts, len(content)).
+    """A cheap identity for one message: (role, timestamp, len(content)).
 
     Used to detect that memory no longer matches a sealed chunk without walking
     the whole array. Never raises -- a malformed message must fail to MATCH,
     not crash a save.
+
+    The timestamp field is read as `timestamp` FIRST, `ts` only as a fallback.
+    That order is not cosmetic: every message producer in this repo writes
+    `timestamp`, and a real 135,634-message production session has 0 messages
+    carrying `ts` against 20,000 of 20,000 sampled carrying `timestamp`. Reading
+    only `ts` made the middle field `None` for every production message, which
+    silently reduced the key to (role, len(content)) and let a same-role,
+    same-length replacement pass as identical. `ts` is kept as a fallback so
+    synthetic fixtures that use the short spelling still key meaningfully.
+
+    The raw value is used, not a float coercion: this key is stored in the
+    manifest as JSON and compared after the round trip, and exactness is the
+    whole point.
     """
     if not isinstance(msg, dict):
         return (None, None, 0)
     content = msg.get('content')
-    return (msg.get('role'), msg.get('ts'), len(content) if isinstance(content, str) else 0)
+    ts = msg.get('timestamp')
+    if ts is None:
+        ts = msg.get('ts')
+    return (msg.get('role'), ts, len(content) if isinstance(content, str) else 0)
 
 
 def _sealed_total(manifest) -> int:
@@ -4777,10 +4793,28 @@ def _manifest_matches_memory(manifest, messages) -> bool:
     key of its first and last message, so this is a handful of comparisons even
     for a 250,000-message session.
 
-    KNOWN RESIDUAL, stated so a future caller knows to bump the key: an in-place
-    edit deep inside a chunk that preserves (role, ts, len(content)) is not
-    detected. No current path edits sealed history without shifting or
-    truncating it -- edit-and-resend truncates.
+    KNOWN RESIDUAL, stated plainly because the earlier wording understated it.
+    Only each chunk's FIRST and LAST message are keyed; the interior is never
+    looked at. So:
+
+    * an edit to an interior message that does not change the array's LENGTH is
+      not detected at all, whatever it changes -- role, timestamp and content
+      included. It is not merely edits that "preserve the key";
+    * a boundary edit is detected unless it preserves all three of role,
+      timestamp and len(content) -- i.e. unless it is the same message.
+
+    Anything that shifts or truncates the array IS detected, via the length
+    check and the boundary indices, and that covers the paths that actually
+    rewrite history: the #2592 collapse, /api/session/clear, intentional
+    shrinks, truncation watermarks, and edit-and-resend (which truncates).
+
+    Two paths do edit messages in place: `_try_retry_journal_recovery_in_place`
+    (api/models.py) and `_merge_display_messages_after_agent_result`
+    (api/streaming.py). Both operate on the newest messages, which live in the
+    unsealed tail (`_SIDECAR_TAIL_KEEP` of them) rather than in a sealed chunk,
+    so in practice they do not reach sealed history. If a future path needs to
+    edit deep inside a sealed chunk, this key is not enough -- verify the
+    chunk's sha256 instead, which is already in the manifest entry.
     """
     if not manifest:
         return True
