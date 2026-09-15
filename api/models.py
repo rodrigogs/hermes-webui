@@ -1153,6 +1153,18 @@ def _read_file_head(path: Path, max_prefix_bytes: int = 4096) -> str:
 _METADATA_PREFIX_MAX_BYTES = 1024 * 1024
 
 
+#: Sealing thresholds for segmented sidecars. A save rewrites the head, so its
+#: cost is the tail's size; sealing keeps the tail bounded. Measured on the
+#: 203 MB production session: 2,000 messages serialise to 1,272,903 bytes and
+#: the 500 kept after a seal to 315,585 -- so a post-seal save writes ~308 KB
+#: where it used to write 203 MB.
+#: HERMES_WEBUI_SIDECAR_TAIL_MAX=0 disables sealing entirely; already-segmented
+#: files stay readable.
+_SIDECAR_TAIL_MAX_MSGS = int(os.getenv('HERMES_WEBUI_SIDECAR_TAIL_MAX', '2000') or 0)
+_SIDECAR_TAIL_MAX_BYTES = int(os.getenv('HERMES_WEBUI_SIDECAR_TAIL_MAX_BYTES', '2097152') or 0)
+_SIDECAR_TAIL_KEEP = 500
+
+
 def _read_metadata_json_prefix(path, max_prefix_bytes=_METADATA_PREFIX_MAX_BYTES):
     """Read only the metadata portion before the large arrays.
 
@@ -4345,6 +4357,81 @@ def _disk_identity(path):
         return None
     return (int(st.st_ino), int(st.st_size),
             int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1_000_000_000))))
+
+
+def _session_chunk_dir(sid):
+    """Directory holding a session's sealed message chunks, or None.
+
+    The `.msgs` suffix is load-bearing: `_SAFE_SID_CHARS` has no dot, so this
+    name can never be mistaken for a session id, and the twelve call sites that
+    enumerate sessions with `SESSION_DIR.glob('*.json')` cannot see inside it.
+    """
+    if not is_safe_session_id(sid):
+        return None
+    return SESSION_DIR / f'{sid}.msgs'
+
+
+def _chunk_path(sid, seq):
+    """Path of one sealed chunk. Zero-padded so glob() order is numeric order."""
+    d = _session_chunk_dir(sid)
+    if d is None:
+        return None
+    return d / f'{int(seq):06d}.json'
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _structural_key(msg):
+    """A cheap identity for one message: (role, ts, len(content)).
+
+    Used to detect that memory no longer matches a sealed chunk without walking
+    the whole array. Never raises -- a malformed message must fail to MATCH,
+    not crash a save.
+    """
+    if not isinstance(msg, dict):
+        return (None, None, 0)
+    content = msg.get('content')
+    return (msg.get('role'), msg.get('ts'), len(content) if isinstance(content, str) else 0)
+
+
+def _sealed_total(manifest) -> int:
+    """Number of messages held in sealed chunks, 0 for anything malformed."""
+    if not isinstance(manifest, list):
+        return 0
+    total = 0
+    for entry in manifest:
+        if isinstance(entry, dict) and isinstance(entry.get('count'), int) and entry['count'] >= 0:
+            total += entry['count']
+    return total
+
+
+def _normalised_manifest(raw):
+    """Return the longest well-formed, CONTINUOUS prefix of a manifest.
+
+    Continuity (`first_idx` == running total) is checked rather than assumed: a
+    manifest whose entries do not chain describes a hole, and the only safe
+    reading of a hole is "the sealed prefix ends before it". Silently skipping
+    it would renumber every later message.
+    """
+    if not isinstance(raw, list):
+        return []
+    out, running = [], 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            break
+        if not isinstance(entry.get('seq'), int) or not isinstance(entry.get('count'), int):
+            break
+        if not isinstance(entry.get('first_idx'), int) or entry['count'] < 0:
+            break
+        if not isinstance(entry.get('file'), str) or not isinstance(entry.get('sha256'), str):
+            break
+        if entry['first_idx'] != running:
+            break
+        out.append(entry)
+        running += entry['count']
+    return out
 
 
 def _legacy_sidecar_facts_get(sid):
