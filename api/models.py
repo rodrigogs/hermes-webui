@@ -1659,7 +1659,39 @@ class Session:
         # defense-in-depth; the cached-side freshness check reads real records,
         # not this, so this is belt-and-suspenders).
         self._anchor_scene_index = dict(meta['anchor_scene_index'])
-        meta['messages'] = self.messages
+        # Segmenting. The head is rewritten on every save, so its cost is the
+        # tail's size; sealing keeps the tail bounded. Measured before this: a
+        # 203,439,398-byte sidecar cost 3.3-4.4 s per save, growing for as long
+        # as the conversation did.
+        #
+        # Chunks land BEFORE the head that references them. That ordering is the
+        # whole crash argument: the worst a crash can leave is an orphan chunk,
+        # which load() ignores. The reverse order could leave a manifest naming
+        # a file that does not exist.
+        _manifest = _normalised_manifest(getattr(self, '_message_chunks', None))
+        _all_msgs = self.messages or []
+        _sealed_n = _sealed_total(_manifest)
+        _tail = _all_msgs[_sealed_n:]
+        if _SIDECAR_TAIL_MAX_MSGS > 0 and len(_tail) > _SIDECAR_TAIL_KEEP:
+            _over_count = len(_tail) > _SIDECAR_TAIL_MAX_MSGS
+            _over_bytes = False
+            if not _over_count and _SIDECAR_TAIL_MAX_BYTES > 0:
+                try:
+                    _over_bytes = len(json.dumps(_tail, ensure_ascii=False).encode('utf-8')) > _SIDECAR_TAIL_MAX_BYTES
+                except (TypeError, ValueError):
+                    _over_bytes = False
+            if _over_count or _over_bytes:
+                _to_seal = _tail[:-_SIDECAR_TAIL_KEEP]
+                _next_seq = max((e['seq'] for e in _manifest), default=0) + 1
+                _entry = _seal_chunk(self.session_id, _next_seq, _to_seal, _sealed_n)
+                if _entry is not None:
+                    _manifest = _manifest + [_entry]
+                    _tail = _tail[-_SIDECAR_TAIL_KEEP:]
+        if _manifest:
+            meta['message_chunks'] = _manifest
+        self._message_chunks = _manifest
+        _head_messages = _tail
+        meta['messages'] = _head_messages
         meta['tool_calls'] = self.tool_calls
         meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
         # The unbounded metadata blobs go AFTER the arrays, so nothing that grows
@@ -4525,6 +4557,42 @@ def _normalised_manifest(raw):
         out.append(entry)
         running += entry['count']
     return out
+
+
+def _seal_chunk(sid, seq, msgs, first_idx):
+    """Write one immutable chunk and return its manifest entry, or None.
+
+    tmp + fsync + rename inside the chunk dir, so a reader never sees a partial
+    chunk. The caller writes the head only after this returns an entry -- see
+    the ordering argument in Session.save.
+    """
+    path = _chunk_path(sid, seq)
+    if path is None:
+        return None
+    body = {'session_id': sid, 'seq': int(seq), 'first_idx': int(first_idx),
+            'count': len(msgs), 'messages': msgs}
+    try:
+        raw = json.dumps(body, ensure_ascii=False).encode('utf-8')
+    except (TypeError, ValueError):
+        logger.error('sidecar chunk seal failed for %s seq %s: unserialisable', sid, seq)
+        return None
+    tmp = path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, 'wb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        _safe_replace(tmp, path)
+    except OSError as exc:
+        logger.error('sidecar chunk seal failed for %s seq %s: %s', sid, seq, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    return {'seq': int(seq), 'file': path.name, 'count': len(msgs),
+            'first_idx': int(first_idx), 'sha256': _sha256_hex(raw)}
 
 
 def _legacy_sidecar_facts_get(sid):
