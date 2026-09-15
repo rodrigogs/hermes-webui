@@ -1232,8 +1232,19 @@ def _read_sidecar_document(path, sid=None):
         return None
     if not isinstance(doc, dict):
         return None
-    manifest = _normalised_manifest(doc.get('message_chunks'))
+    raw_manifest = doc.get('message_chunks')
+    manifest = _normalised_manifest(raw_manifest)
+    # _normalised_manifest silently returns the longest safe prefix -- correct
+    # for that function, which has no opinion, but this layer owes the operator
+    # visibility: a manifest that broke continuity (or carried a malformed
+    # entry) must not look like a complete read just because the prefix parsed.
+    dropped = len(raw_manifest) - len(manifest) if isinstance(raw_manifest, list) else 0
     if not manifest:
+        if dropped:
+            msg = (f'manifest dropped at position 0: {dropped} of {len(raw_manifest)} '
+                   f'entries did not chain or were malformed; no sealed chunks read')
+            logger.error('sidecar chunk problem for %s: %s', sid or doc.get('session_id'), msg)
+            doc['chunk_errors'] = [msg]
         return doc
     sid = sid or doc.get('session_id')
     chunk_dir = _session_chunk_dir(sid)
@@ -1241,27 +1252,38 @@ def _read_sidecar_document(path, sid=None):
         doc['chunk_errors'] = [f'unsafe session id {sid!r}; sealed chunks not read']
         return doc
     sealed, errors = [], []
+    if dropped:
+        errors.append(f'manifest truncated after {len(manifest)} of {len(raw_manifest)} entries: '
+                       f'continuity broke or an entry was malformed; entries after the break are dropped')
     for entry in manifest:
-        f = chunk_dir / entry['file']
+        fname = entry['file']
+        # The manifest is read off disk, not generated: a hand-edited or
+        # corrupted head could name "../../etc/passwd" or an absolute path.
+        # Refuse anything that isn't a bare filename BEFORE joining it onto
+        # chunk_dir, so a traversal is never even opened, only reported.
+        if Path(fname).name != fname:
+            errors.append(f"{fname}: refused, not a plain chunk filename")
+            continue
+        f = chunk_dir / fname
         try:
             raw = f.read_bytes()
         except OSError as exc:
-            errors.append(f"{entry['file']}: unreadable ({exc.__class__.__name__})")
+            errors.append(f"{fname}: unreadable ({exc.__class__.__name__})")
             continue
         if _sha256_hex(raw) != entry['sha256']:
-            errors.append(f"{entry['file']}: sha256 mismatch")
+            errors.append(f"{fname}: sha256 mismatch")
             continue
         try:
             body = json.loads(raw)
         except Exception:
-            errors.append(f"{entry['file']}: not valid JSON")
+            errors.append(f"{fname}: not valid JSON")
             continue
         msgs = body.get('messages') if isinstance(body, dict) else None
         if not isinstance(msgs, list):
-            errors.append(f"{entry['file']}: no messages array")
+            errors.append(f"{fname}: no messages array")
             continue
         if len(msgs) != entry['count']:
-            errors.append(f"{entry['file']}: count {entry['count']} != {len(msgs)} in body")
+            errors.append(f"{fname}: count {entry['count']} != {len(msgs)} in body")
             continue
         sealed.extend(msgs)
     tail = doc.get('messages')

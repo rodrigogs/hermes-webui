@@ -140,6 +140,40 @@ def test_torn_head_returns_none(session_store):
     assert M._read_sidecar_document(p, "s7") is None
 
 
+def test_manifest_entry_with_path_traversal_filename_is_refused(session_store):
+    """A hand-edited or corrupted head can name a `file` outside the chunk
+    dir. It must be refused before it is ever opened, not silently followed."""
+    c1 = _write_chunk(session_store, "s10", 1, _msgs(0, 2), 0)
+    # A decoy outside the chunk dir: if the guard were missing, this is what a
+    # "../" escape would read instead of refusing the entry.
+    (session_store / "escape.json").write_text(
+        json.dumps({"messages": _msgs(900, 9)}), encoding="utf-8")
+    c1["file"] = "../escape.json"
+    p = _write_head(session_store, "s10", [c1], _msgs(2, 1))
+
+    out = M._read_sidecar_document(p, "s10")
+
+    assert [m["content"] for m in out["messages"]] == ["m2"], "decoy never read; rest of session still loads"
+    assert any("../escape.json" in e for e in out["chunk_errors"])
+
+
+def test_manifest_truncation_from_broken_continuity_is_reported(session_store):
+    """entry 3's first_idx does not chain: _normalised_manifest silently drops
+    it (and everything after) from the returned prefix. The reader must not
+    let that truncation look like a complete read."""
+    c1 = _write_chunk(session_store, "s11", 1, _msgs(0, 2), 0)
+    c2 = _write_chunk(session_store, "s11", 2, _msgs(2, 2), 2)
+    c3 = _write_chunk(session_store, "s11", 3, _msgs(4, 2), 4)
+    c3["first_idx"] = 999  # continuity break: normalised_manifest stops before this entry
+    p = _write_head(session_store, "s11", [c1, c2, c3], _msgs(6, 1))
+
+    out = M._read_sidecar_document(p, "s11")
+
+    assert [m["content"] for m in out["messages"]] == ["m0", "m1", "m2", "m3", "m6"]
+    assert any("truncat" in e.lower() for e in out["chunk_errors"])
+    assert out["message_count"] == M._sealed_total([c1, c2, c3]) + 1, "the original claim stays visible"
+
+
 def test_session_load_reads_a_segmented_session(session_store):
     """The integration point: Session.load must return the full history."""
     c1 = _write_chunk(session_store, "s8", 1, _msgs(0, 4), 0)
