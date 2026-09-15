@@ -1669,6 +1669,27 @@ class Session:
         # which load() ignores. The reverse order could leave a manifest naming
         # a file that does not exist.
         _manifest = _normalised_manifest(getattr(self, '_message_chunks', None))
+        if not _manifest_matches_memory(_manifest, self.messages):
+            # History was rewritten in place (collapse #2592, clear #5532,
+            # intentional shrink #6911, truncation, edit-and-resend). The sealed
+            # chunks describe a prefix this object no longer has, so re-seal from
+            # memory with fresh seq numbers. Correctness over cost: the one-off
+            # price is today's every-save price, and the old files stay on disk
+            # as orphans rather than being deleted.
+            # Seq comes from DISK, never from the manifest we are discarding: a
+            # never-loaded object has an empty manifest, and max(..., default=0)+1
+            # then picks seq 1 and OVERWRITES an existing chunk. That was proven
+            # in Task 3 to destroy the .bak's referent (restoring it returned 4 of
+            # 30 claimed messages) and was fixed there by _next_chunk_seq.
+            logger.info('sidecar %s: sealed chunks no longer match memory, re-sealing', self.session_id)
+            _reseal_from = _next_chunk_seq(self.session_id)
+            _manifest = []
+            _all = self.messages or []
+            if _SIDECAR_TAIL_MAX_MSGS > 0 and len(_all) > _SIDECAR_TAIL_KEEP:
+                _entry = _seal_chunk(self.session_id, _reseal_from,
+                                     _all[:-_SIDECAR_TAIL_KEEP], 0)
+                if _entry is not None:
+                    _manifest = [_entry]
         _all_msgs = self.messages or []
         _sealed_n = _sealed_total(_manifest)
         _tail = _all_msgs[_sealed_n:]
@@ -1883,6 +1904,16 @@ class Session:
         if _pre_read_identity is not None:
             session._disk_identity_seen = _pre_read_identity
             session._disk_msg_count = _on_disk_len
+        # The manifest as VALIDATED (continuity-checked), not as found in the
+        # file: save() compares against this, so a malformed tail of the
+        # manifest must not survive a load-save round trip.
+        #
+        # This is also what makes segmenting actually pay off. Without it every
+        # loaded object starts with an empty manifest, so the next save treats
+        # the whole reassembled history as unsealed and re-seals all of it into
+        # a fresh chunk -- orphaning the previous one and paying the full-history
+        # write price the chunking exists to avoid.
+        session._message_chunks = _normalised_manifest(data.get('message_chunks'))
         if _collapsed_partials:
             try:
                 # Self-heal bloated sessions on first full load without touching
@@ -4685,8 +4716,55 @@ def _seal_chunk(sid, seq, msgs, first_idx):
             os.close(_dir_fd)
     except OSError:
         pass
+    # first_key/last_key are what make the memory-vs-disk check O(len(manifest))
+    # instead of O(len(messages)) -- see _manifest_matches_memory. Stored as
+    # lists because JSON has no tuples; compared after tuple(...).
     return {'seq': int(seq), 'file': path.name, 'count': len(msgs),
-            'first_idx': int(first_idx), 'sha256': _sha256_hex(raw)}
+            'first_idx': int(first_idx), 'sha256': _sha256_hex(raw),
+            'first_key': list(_structural_key(msgs[0])) if msgs else None,
+            'last_key': list(_structural_key(msgs[-1])) if msgs else None}
+
+
+def _manifest_matches_memory(manifest, messages) -> bool:
+    """True when the in-memory array still starts with the sealed prefix.
+
+    O(len(manifest)), not O(len(messages)): each entry carries the structural
+    key of its first and last message, so this is a handful of comparisons even
+    for a 250,000-message session.
+
+    KNOWN RESIDUAL, stated so a future caller knows to bump the key: an in-place
+    edit deep inside a chunk that preserves (role, ts, len(content)) is not
+    detected. No current path edits sealed history without shifting or
+    truncating it -- edit-and-resend truncates.
+    """
+    if not manifest:
+        return True
+    msgs = messages or []
+    if len(msgs) < _sealed_total(manifest):
+        return False
+    for entry in manifest:
+        first_idx = entry['first_idx']
+        if entry['count'] <= 0:
+            # _normalised_manifest tolerates count == 0 (it only rejects < 0),
+            # and this loop's last_idx would then be first_idx - 1 -- i.e. a
+            # negative index that silently reads the wrong end of the array.
+            # Nothing here writes an empty chunk, so such an entry is corrupt
+            # or hand-edited: unverifiable, therefore untrusted.
+            return False
+        last_idx = first_idx + entry['count'] - 1
+        if last_idx >= len(msgs):
+            return False
+        want_first = entry.get('first_key')
+        want_last = entry.get('last_key')
+        if want_first is None or want_last is None:
+            # A chunk sealed before the keys existed: cannot be checked, so it
+            # cannot be trusted either.
+            return False
+        if tuple(want_first) != _structural_key(msgs[first_idx]):
+            return False
+        if tuple(want_last) != _structural_key(msgs[last_idx]):
+            return False
+    return True
 
 
 def _legacy_sidecar_facts_get(sid):

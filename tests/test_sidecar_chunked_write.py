@@ -276,21 +276,13 @@ def test_seal_chunk_refuses_to_clobber_an_existing_file(session_store):
     assert path.read_bytes() == before, "an already-occupied seq must not be overwritten"
 
 
-# ── known hole: memory is trusted about what is already sealed on disk ──────
+# ── memory is NOT trusted about what is already sealed on disk ──────────────
+# This was a known hole (`_tail = self.messages[_sealed_n:]` trusted
+# self.messages about what was already sealed, so a truncation below the sealed
+# count left the head naming every sealed chunk and a reload resurrected the
+# truncated messages). Closed by _manifest_matches_memory + the re-seal in
+# Session.save; the xfail marker was removed when that landed.
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Known hole, the fourth instance of in-memory state used as the "
-    "authority for something whose truth is on disk (after: seq allocation, "
-    "and the two already fixed in this task's earlier rounds). "
-    "`_tail = self.messages[_sealed_n:]` trusts self.messages about what is "
-    "already sealed. Once an object has sealed, truncating self.messages "
-    "below the sealed count and saving leaves the head still naming every "
-    "sealed chunk (message_chunks unchanged, tail now []), so a reload "
-    "concatenates the untouched sealed chunks back in front of nothing and "
-    "resurrects the truncated messages instead of applying the truncation. "
-    "Task 4 (_manifest_matches_memory + re-seal-from-memory) fixes this; "
-    "remove this xfail marker when Task 4 lands."
-))
 def test_truncating_below_the_sealed_count_does_not_silently_revert(session_store):
     s = _sess(session_store, "w16", _msgs(0, 30))
     s.save()
