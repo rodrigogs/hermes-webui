@@ -1213,10 +1213,72 @@ def _read_metadata_json_prefix(path, max_prefix_bytes=_METADATA_PREFIX_MAX_BYTES
     return f'{prefix}\n}}'
 
 
+def _read_sidecar_document(path, sid=None):
+    """Read a sidecar head and its sealed chunks into one document.
+
+    Returns today's document shape -- `messages` is the complete history -- so
+    every caller downstream of this function is unchanged. Returns None only
+    when the HEAD itself cannot be read or parsed (the torn-file case the
+    recovery path depends on).
+
+    A chunk that is missing, fails its sha256, or disagrees with its manifest
+    entry is SKIPPED and named in `doc['chunk_errors']`. The session opens with
+    a gap rather than not at all, `message_count` keeps the manifest's claim so
+    the discrepancy is visible, and nothing is deleted.
+    """
+    try:
+        doc = json.loads(path.read_bytes())
+    except Exception:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    manifest = _normalised_manifest(doc.get('message_chunks'))
+    if not manifest:
+        return doc
+    sid = sid or doc.get('session_id')
+    chunk_dir = _session_chunk_dir(sid)
+    if chunk_dir is None:
+        doc['chunk_errors'] = [f'unsafe session id {sid!r}; sealed chunks not read']
+        return doc
+    sealed, errors = [], []
+    for entry in manifest:
+        f = chunk_dir / entry['file']
+        try:
+            raw = f.read_bytes()
+        except OSError as exc:
+            errors.append(f"{entry['file']}: unreadable ({exc.__class__.__name__})")
+            continue
+        if _sha256_hex(raw) != entry['sha256']:
+            errors.append(f"{entry['file']}: sha256 mismatch")
+            continue
+        try:
+            body = json.loads(raw)
+        except Exception:
+            errors.append(f"{entry['file']}: not valid JSON")
+            continue
+        msgs = body.get('messages') if isinstance(body, dict) else None
+        if not isinstance(msgs, list):
+            errors.append(f"{entry['file']}: no messages array")
+            continue
+        if len(msgs) != entry['count']:
+            errors.append(f"{entry['file']}: count {entry['count']} != {len(msgs)} in body")
+            continue
+        sealed.extend(msgs)
+    tail = doc.get('messages')
+    doc['messages'] = sealed + (tail if isinstance(tail, list) else [])
+    if errors:
+        for e in errors:
+            logger.error('sidecar chunk problem for %s: %s', sid, e)
+        doc['chunk_errors'] = errors
+    return doc
+
+
 def _load_session_from_path(path: Path) -> "Session | None":
     """Load a session from an explicit JSON path without consulting SESSION_DIR."""
     try:
-        data = json.loads(path.read_bytes())
+        data = _read_sidecar_document(path)
+        if data is None:
+            return None
     except Exception:
         return None
     data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
@@ -1336,6 +1398,7 @@ class Session:
                  pending_started_at=None,
                  pending_user_source: str=None,
                  context_messages=None,
+                 message_chunks=None,
                  compression_anchor_visible_idx=None,
                  compression_anchor_message_key=None,
                  compression_anchor_summary=None,
@@ -1489,6 +1552,12 @@ class Session:
         # never sets them and so always takes the full-parse path.
         self._disk_identity_seen = None
         self._disk_msg_count = None
+        # The sealed-chunk manifest for this object's sidecar, as last read or
+        # written. Empty for an unsegmented session and for a metadata-only stub.
+        # Deliberately NOT taken from the `message_chunks` argument: Task 4's
+        # load() sets it explicitly after validating continuity, and save() sets
+        # what it wrote. Accepting the kwarg here only stops cls(**data) raising.
+        self._message_chunks = []
         raw_message_count = kwargs.get('message_count')
         parsed_message_count = None
         if raw_message_count is not None:
@@ -1736,7 +1805,9 @@ class Session:
         # Bytes, not read_text: json.loads detects UTF-8 itself, and skipping the
         # TextIOWrapper decode into an intermediate str measured 1.9x on a 112 MB
         # sidecar (862 -> 453 ms, best of 3, warm). Same objects, same errors.
-        data = json.loads(p.read_bytes())
+        data = _read_sidecar_document(p, sid)
+        if data is None:
+            return None
         # The ON-DISK length, taken before the collapse below shortens the object.
         # It is what save() must compare against, so the #2592 self-heal save
         # still sees a shrink and writes its .bak. Same expression save() uses.
