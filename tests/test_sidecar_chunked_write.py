@@ -198,3 +198,79 @@ def test_unsegmented_shrink_through_a_fresh_object_is_unaffected(session_store):
     assert bak_path.exists()
     bak_doc = json.loads(bak_path.read_bytes())
     assert len(bak_doc["messages"]) == 5, "unsegmented fallback must still count messages directly"
+
+
+# ── chunk seq allocation must come from disk, not from an object's own manifest ──
+
+def test_reseal_through_a_fresh_object_never_overwrites_an_existing_chunk(session_store):
+    """Regression, proven by execution against f0ebb4f5: a fresh Session
+    object's in-memory manifest is always [], so `max(manifest seq) + 1`
+    picks seq=1 again and clobbers the first chunk's bytes under the same
+    filename -- breaking write-once chunks AND making the .bak (whose
+    manifest still names that file with the OLD sha256) unrestorable."""
+    s = _sess(session_store, "w14", _msgs(0, 30))
+    s.save()
+    chunk_path = session_store / "w14.msgs" / "000001.json"
+    original_bytes = chunk_path.read_bytes()
+    bak_doc_before_reseal = None  # captured below, before the second save
+
+    # A fresh object, never loaded: _message_chunks is [], and its 20 DIFFERENT
+    # messages are both a genuine shrink (20 < 30, so the #1558 guard backs up)
+    # and, on their own, past the sealing threshold (triggers a reseal).
+    fresh = _sess(session_store, "w14", _msgs(100, 20))
+    fresh.save()
+
+    assert chunk_path.read_bytes() == original_bytes, "the first chunk must never be overwritten"
+    doc = json.loads((session_store / "w14.json").read_bytes())
+    assert max(e["seq"] for e in doc["message_chunks"]) > 1, \
+        "the reseal must claim a seq higher than the existing chunk, not reuse it"
+
+    bak_path = session_store / "w14.json.bak"
+    assert bak_path.exists()
+    bak_doc_before_reseal = json.loads(bak_path.read_bytes())
+    expected_total = (M._sealed_total(bak_doc_before_reseal.get("message_chunks"))
+                       + len(bak_doc_before_reseal["messages"]))
+    assert expected_total == 30
+
+    # Restore: copy the .bak over the head and read it back through the real
+    # chunked-read path. Because 000001.json was never touched, this must be
+    # fully recoverable -- the whole point of keeping a .bak at all.
+    head_path = session_store / "w14.json"
+    head_path.write_bytes(bak_path.read_bytes())
+    restored = M._read_sidecar_document(head_path, "w14")
+    assert restored is not None
+    assert "chunk_errors" not in restored, restored.get("chunk_errors")
+    assert len(restored["messages"]) == expected_total
+
+
+def test_next_chunk_seq_skips_a_gap(session_store):
+    d = session_store / "gap1.msgs"
+    d.mkdir(parents=True)
+    (d / "000001.json").write_text("{}", encoding="utf-8")
+    (d / "000005.json").write_text("{}", encoding="utf-8")
+    assert M._next_chunk_seq("gap1") == 6
+
+
+def test_next_chunk_seq_ignores_non_conforming_names(session_store):
+    d = session_store / "gap2.msgs"
+    d.mkdir(parents=True)
+    (d / "000001.json").write_text("{}", encoding="utf-8")
+    (d / "notes.txt").write_text("not a chunk", encoding="utf-8")
+    (d / "0001.json").write_text("{}", encoding="utf-8")  # four digits, not six
+    assert M._next_chunk_seq("gap2") == 2
+
+
+def test_next_chunk_seq_is_1_when_the_directory_is_absent(session_store):
+    assert M._next_chunk_seq("nope-yet") == 1
+
+
+def test_seal_chunk_refuses_to_clobber_an_existing_file(session_store):
+    path = M._chunk_path("w15", 1)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"already": "here"}')
+    before = path.read_bytes()
+
+    result = M._seal_chunk("w15", 1, _msgs(0, 3), 0)
+
+    assert result is None
+    assert path.read_bytes() == before, "an already-occupied seq must not be overwritten"

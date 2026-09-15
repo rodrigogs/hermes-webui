@@ -1682,7 +1682,7 @@ class Session:
                     _over_bytes = False
             if _over_count or _over_bytes:
                 _to_seal = _tail[:-_SIDECAR_TAIL_KEEP]
-                _next_seq = max((e['seq'] for e in _manifest), default=0) + 1
+                _next_seq = _next_chunk_seq(self.session_id)
                 _entry = _seal_chunk(self.session_id, _next_seq, _to_seal, _sealed_n)
                 if _entry is not None:
                     _manifest = _manifest + [_entry]
@@ -4568,6 +4568,43 @@ def _normalised_manifest(raw):
     return out
 
 
+_CHUNK_FILENAME_RE = re.compile(r'^(\d{6})\.json$')
+
+
+def _next_chunk_seq(sid):
+    """The next unused chunk seq for `sid`, derived from DISK, not memory.
+
+    An in-memory manifest (`Session._message_chunks`) only reflects what THIS
+    object has loaded or written. A never-`.load()`-ed `Session` starts with
+    an empty manifest regardless of what is already sealed on disk, so
+    `max(seq in manifest) + 1` can hand out a seq a PRIOR save already used --
+    silently overwriting that chunk's bytes under the same filename. Scanning
+    the chunk directory for the highest existing `NNNNNN.json` name and
+    returning one past it is what keeps chunks write-once regardless of which
+    object, in which process, is doing the sealing.
+
+    Returns 1 when the directory is absent, empty, or has no conforming name.
+    A seq may end up SKIPPED (e.g. an orphan chunk from a crash still holds
+    its number) -- harmless, since the manifest chains on `first_idx`, never
+    on `seq` contiguity. Names that do not parse as exactly six digits plus
+    `.json` are ignored, not treated as an error: a stray file must not block
+    sealing.
+    """
+    d = _session_chunk_dir(sid)
+    if d is None:
+        return 1
+    try:
+        names = [p.name for p in d.iterdir()]
+    except OSError:
+        return 1
+    best = 0
+    for name in names:
+        m = _CHUNK_FILENAME_RE.match(name)
+        if m:
+            best = max(best, int(m.group(1)))
+    return best + 1
+
+
 def _seal_chunk(sid, seq, msgs, first_idx):
     """Write one immutable chunk and return its manifest entry, or None.
 
@@ -4577,6 +4614,12 @@ def _seal_chunk(sid, seq, msgs, first_idx):
     """
     path = _chunk_path(sid, seq)
     if path is None:
+        return None
+    if path.exists():
+        # Belt and braces on top of _next_chunk_seq: a caller that hands us a
+        # seq already on disk is a bug, and the one thing this function must
+        # never do is silently overwrite an immutable chunk.
+        logger.error('sidecar chunk seal refused for %s seq %s: %s already exists', sid, seq, path.name)
         return None
     body = {'session_id': sid, 'seq': int(seq), 'first_idx': int(first_idx),
             'count': len(msgs), 'messages': msgs}
