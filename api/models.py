@@ -1275,6 +1275,38 @@ def model_explicit_pick_signature(model, model_provider) -> str:
     return f"{_m}\x1f{_p}"
 
 
+#: The unbounded metadata fields, and the ones save() writes AFTER `messages`.
+#: #5854 did this for `anchor_activity_scenes`; these six stayed in the metadata
+#: prefix, and one of them -- a 73,192-byte `compression_anchor_summary` on a
+#: production session -- pushed the `messages` key past the 64 KB prefix budget,
+#: so every sidebar poll fell back to a full 112 MB parse (the #4633 recurrence;
+#: 4.0 GB RSS, 7 OOM kills on 2026-09-14). The 1 MiB backstop since added buys
+#: headroom; this removes the mechanism, because all six grow for the life of a
+#: session.
+#:
+#: Not here on purpose: `share_token`, `process_wakeup_pause`, `gateway_routing`
+#: and the other small scalars. A prefix reader may legitimately want them, and
+#: moving them would drop them from every metadata-only stub for no size gain.
+#:
+#: A metadata-only stub therefore never carries these six (it never did
+#: reliably: any of them could already overflow the prefix). Every reader was
+#: audited on this tree: compact() emits them for whatever object it is given;
+#: the UI reads them only off S.session, which is only ever assigned from a
+#: full load (ui.js never requests a metadata-only /api/session); the pin-quota
+#: helper reads other fields off compact(); the eviction check consults
+#: `composer_draft` only after `_loaded_metadata_only` has already returned;
+#: and the routes that read them obtain their session with get_session(sid),
+#: a full load.
+_HEAVY_METADATA_TAIL_FIELDS = (
+    'compression_anchor_summary',
+    'compression_anchor_details',
+    'context_engine_state',
+    'compression_recovery',
+    'gateway_routing_history',
+    'composer_draft',
+)
+
+
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
@@ -1491,22 +1523,21 @@ class Session:
             'personality', 'active_stream_id',
             'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
-            'compression_anchor_summary', 'pre_compression_snapshot',
+            'pre_compression_snapshot',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
-            'compression_anchor_details', 'context_engine_state',
             'context_length', 'threshold_tokens', 'last_prompt_tokens',
             'post_compression_context_tokens_estimate',
-            'compression_recovery', 'recommended_recovery_action',
+            'recommended_recovery_action',
             'compression_recovery_source_session_id', 'compression_recovery_action',
             'truncation_watermark',
             'truncation_boundary',
             'clear_generation',
             'intentional_shrink_generation',
-            'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
+            'gateway_routing', 'llm_title_generated', 'manual_title',
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
-            'enabled_toolsets', 'composer_draft',
+            'enabled_toolsets',
             'process_wakeup_pause',
             'share_token', 'share_created_at',
         ]
@@ -1528,9 +1559,18 @@ class Session:
         meta['messages'] = self.messages
         meta['tool_calls'] = self.tool_calls
         meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
+        # The unbounded metadata blobs go AFTER the arrays, so nothing that grows
+        # for the life of a session can push `messages` out of the cheap prefix
+        # again. See _HEAVY_METADATA_TAIL_FIELDS for what and why. A file already
+        # on disk in the old layout still loads (a full load reads everything;
+        # the metadata path falls back) and is rewritten like this on its first
+        # save.
+        for _k in _HEAVY_METADATA_TAIL_FIELDS:
+            meta[_k] = getattr(self, _k, None)
         # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
         # the keys we placed explicitly above so they aren't emitted twice.
-        _placed = {'message_count', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes'}
+        _placed = {'message_count', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes',
+                   *_HEAVY_METADATA_TAIL_FIELDS}
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}

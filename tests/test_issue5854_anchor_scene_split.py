@@ -178,6 +178,24 @@ def test_parity_cache_not_forced_reload_when_prefix_read_fails(session_store):
     s.anchor_activity_scenes = scenes
     s.compression_anchor_summary = oversized
     s.save()
+    # save() now writes compression_anchor_summary AFTER messages, so a fresh
+    # save can no longer overflow the prefix. This test is about the slow path,
+    # so put the file back in the layout that reaches it: the blob before
+    # messages, as every sidecar on disk before the reorder has it.
+    _p1 = session_store / "p1.json"
+    _doc = json.loads(_p1.read_text(encoding="utf-8"))
+    _tail = {"messages", "tool_calls", "anchor_activity_scenes"}
+    _old = {}
+    for _k, _v in _doc.items():
+        if _k == "compression_anchor_summary" or _k in _tail:
+            continue
+        _old[_k] = _v
+        if _k == "updated_at":
+            _old["compression_anchor_summary"] = _doc["compression_anchor_summary"]
+    for _k in ("messages", "tool_calls", "anchor_activity_scenes"):
+        if _k in _doc:
+            _old[_k] = _doc[_k]
+    _p1.write_text(json.dumps(_old, ensure_ascii=False, indent=2), encoding="utf-8")
     # Sanity: the cheap prefix genuinely fails for this file (slow path taken).
     assert M._read_metadata_json_prefix(session_store / "p1.json") is None
     # A cached full session at exact parity (same scene key + updated_at) whose
