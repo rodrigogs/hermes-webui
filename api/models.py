@@ -1574,6 +1574,16 @@ class Session:
         # never sets them and so always takes the full-parse path.
         self._disk_identity_seen = None
         self._disk_msg_count = None
+        # Non-empty when the read that produced this object could NOT see the
+        # whole history: a sealed chunk was missing, unreadable, or failed its
+        # sha256, so `messages` has a HOLE. Initialised here, on every object,
+        # rather than being read out of `kwargs`: `_read_sidecar_document`
+        # reports the problem as `doc['chunk_errors']`, and `cls(**data)`
+        # silently absorbs that key into **kwargs -- which is exactly how the
+        # fact got lost. An object carrying this must never be allowed to
+        # overwrite the head as if its shorter array were the truth; see the
+        # #1558 guard in save() and the identity stamp in load().
+        self._chunk_read_incomplete = []
         # The sealed-chunk manifest for this object's sidecar, as last read or
         # written. Empty for an unsegmented session and for a metadata-only stub.
         # Deliberately NOT taken from the `message_chunks` argument: Task 4's
@@ -1775,6 +1785,24 @@ class Session:
                         # returning 0, so this is a no-op for them.
                         existing_msg_count = (len(existing.get('messages') or []) +
                                                _sealed_total(existing.get('message_chunks')))
+                        # ...and never LESS than what the head CLAIMS. The two
+                        # agree for every head this code writes, so this is
+                        # normally a no-op. It stops mattering only in the case
+                        # that matters: when part of the history cannot be
+                        # counted from the file we are about to replace -- a
+                        # manifest entry whose `count` is malformed (skipped by
+                        # _sealed_total) or an unreadable chunk whose messages
+                        # this object never saw. `message_count` is written
+                        # BEFORE `messages` on purpose (#5854) and is the head's
+                        # own statement of its total, so taking the larger of the
+                        # two is what keeps the guard's contract ("back up
+                        # anything that would shrink the array") true when the
+                        # array cannot be fully re-counted. Erring high only ever
+                        # costs a .bak that duplicates the current head; erring
+                        # low silently discards messages.
+                        _claimed = _parse_nonnegative_int(existing.get('message_count'))
+                        if _claimed is not None and _claimed > existing_msg_count:
+                            existing_msg_count = _claimed
                     except (json.JSONDecodeError, ValueError):
                         existing_msg_count = -1  # corrupt → always back up
                 incoming_msg_count = len(self.messages or [])
@@ -1898,10 +1926,27 @@ class Session:
         _on_disk_len = len(data.get('messages') or [])
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
         session = cls(**data)
+        # A chunk was missing, unreadable, or failed its sha256: `messages` has a
+        # HOLE, and `_on_disk_len` counts only what could be reassembled, NOT
+        # what the file claims. Carry the fact explicitly (cls(**data) drops
+        # `chunk_errors` into **kwargs) and, critically, do NOT stamp the
+        # fast-path identity: that stamp tells save() "the on-disk total is
+        # already known", and a gapped count in that slot makes the #1558 guard
+        # compare 4 against 4, see no shrink, write no .bak, and permanently
+        # orphan the messages the unreadable chunk held -- turning a TRANSIENT
+        # read error (an NFS blip, a half-synced file) into permanent loss.
+        # Leaving the slots unset forces the guard down its slow path, which
+        # re-reads the head and honours its claim.
+        #
+        # Fail-open, deliberately: the session still opens and still saves.
+        # Refusing to save would strand whatever the user has typed since.
+        _chunk_errors = data.get('chunk_errors')
+        if isinstance(_chunk_errors, list) and _chunk_errors:
+            session._chunk_read_incomplete = list(_chunk_errors)
         # Same TOCTOU stance as _pre_read_sig: if the file was replaced between
         # the stat and the read, this identity describes the OLD file, the next
         # save sees a mismatch, and it falls back to the full parse. Safe side.
-        if _pre_read_identity is not None:
+        elif _pre_read_identity is not None:
             session._disk_identity_seen = _pre_read_identity
             session._disk_msg_count = _on_disk_len
         # The manifest as VALIDATED (continuity-checked), not as found in the

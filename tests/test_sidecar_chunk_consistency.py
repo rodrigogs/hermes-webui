@@ -102,6 +102,69 @@ def test_manifest_matches_memory_detects_each_divergence():
     assert M._manifest_matches_memory([], msgs) is True, "no manifest, nothing to contradict"
 
 
+def test_a_transient_chunk_read_error_cannot_become_permanent_loss(session_store):
+    """The whole point of the #1558 .bak, on a segmented session.
+
+    A chunk goes momentarily unreadable, load() therefore returns only the tail,
+    and the app then does an ORDINARY save. That save rewrites the head around
+    the hole -- so it must be treated as the shrink it is and leave a .bak that
+    still refers to the sealed chunk, or a transient read error (an NFS blip, a
+    half-synced file) silently orphans the sealed history for good.
+    """
+    s = M.Session(session_id="k7", title="T", workspace=str(session_store.parent),
+                  model="glm", messages=_msgs(0, 30))
+    s.save()
+    sealed_n = M._sealed_total(json.loads((session_store / "k7.json").read_bytes())["message_chunks"])
+    assert sealed_n > 0
+    chunk = session_store / "k7.msgs" / "000001.json"
+    stashed = chunk.read_bytes()
+    chunk.unlink()  # transient: the bytes come back at the end of this test
+
+    gapped = M.Session.load("k7")
+    assert len(gapped.messages) == 30 - sealed_n, "only the tail could be reassembled"
+
+    gapped.save()  # an ordinary save, not a deliberate shrink
+
+    bak = session_store / "k7.json.bak"
+    assert bak.exists(), "a save from an incomplete read must back the head up"
+    bak_doc = json.loads(bak.read_bytes())
+    assert bak_doc["message_count"] == 30
+    assert len(bak_doc["messages"]) + M._sealed_total(bak_doc.get("message_chunks")) == 30, \
+        "the .bak must hold the pre-gap total, not the gapped one"
+
+    # The chunk comes back. The .bak still names it, so the full history is
+    # reachable again -- which is what makes the backup worth anything.
+    chunk.write_bytes(stashed)
+    (session_store / "k7.json").write_bytes(bak.read_bytes())
+    assert [m["content"] for m in M.Session.load("k7").messages] == [f"m{i}" for i in range(30)]
+
+
+def test_an_incomplete_read_is_marked_and_gets_no_fast_path_identity(session_store):
+    s = M.Session(session_id="k8", title="T", workspace=str(session_store.parent),
+                  model="glm", messages=_msgs(0, 30))
+    s.save()
+    (session_store / "k8.msgs" / "000001.json").unlink()
+
+    gapped = M.Session.load("k8")
+
+    assert gapped._chunk_read_incomplete, "the gap must survive onto the object, not into **kwargs"
+    assert gapped._disk_identity_seen is None, "a gapped read must not claim to know the file"
+    assert gapped._disk_msg_count is None, "a gapped count in the fast-path slot is the bug"
+
+
+def test_a_healthy_segmented_load_keeps_the_fast_path_and_backs_nothing_up(session_store):
+    """The guard against over-correcting: healthy saves must stay cheap."""
+    s = _segmented(session_store, "k9", n=30)
+    assert s._chunk_read_incomplete == []
+    assert s._disk_identity_seen is not None, "a complete read still records the identity"
+    assert s._disk_msg_count == 30, "and the TOTAL, not the tail"
+
+    s.messages = s.messages + _msgs(200, 1)
+    s.save()
+
+    assert not (session_store / "k9.json.bak").exists(), "a grow-save must still not back up"
+
+
 def test_collapse_on_load_reseals_and_still_backs_up_the_head(session_store):
     """#2592 + #1558 together on a segmented session: load() collapses adjacent
     partials and immediately saves the shorter transcript, which is a shrink, so
