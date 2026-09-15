@@ -68,6 +68,9 @@ from api.models import (
     StateDBSessionMessagesSnapshot,
     _is_empty_partial_activity_message,
     _evict_sessions_over_cap,
+    _normalised_manifest,
+    _parse_nonnegative_int,
+    _sealed_total,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
     record_process_wakeup_provider_unavailable_pause,
@@ -4915,6 +4918,47 @@ def generate_session_title_for_session(session, *, prefer_latest: bool = False, 
     return None, llm_status or 'empty_title', raw_preview
 
 
+def _retarget_session_sidecar(s, sid, *, manifest=None) -> None:
+    """Point a live Session object at a DIFFERENT sidecar file.
+
+    Three private attributes on a ``Session`` are statements about ONE specific
+    file -- the sidecar the object last read or wrote -- not about the object:
+
+    * ``_message_chunks``: the sealed-chunk manifest. Its ``file`` entries are
+      bare names resolved against ``<session_id>.msgs``, so the instant
+      ``session_id`` changes they name files in a directory that belongs to
+      another session, or to nothing at all.
+    * ``_disk_identity_seen`` / ``_disk_msg_count``: the #1558 backup guard's
+      fast path, i.e. "the on-disk total for ``self.path`` is already known".
+      Against a different path they can only be wrong.
+
+    Assigning ``session_id`` in place and saving therefore writes a coherent-
+    looking head full of foreign references. Measured on this path before the
+    fix: a 30-message session segmented under ``newsid``, retargeted to
+    ``oldsid`` and saved, produced an ``oldsid`` head naming ``000001.json``
+    with no ``oldsid.msgs`` directory at all -- loading it returned 4 of 30
+    claimed messages with ``chunk_errors: FileNotFoundError``. Since the
+    archived snapshot is the only persistent copy of the uncompressed
+    conversation (#2223), that is silent data loss.
+
+    ``manifest`` is the manifest read out of the TARGET file's head, when the
+    caller has just parsed it -- disk-derived authority for the file we are
+    about to overwrite, which lets the following save stay append-only instead
+    of re-sealing the whole history. Omit it (or pass a malformed value) and the
+    manifest is cleared, which makes the next ``save()`` re-seal from memory
+    under the new sid, allocating seqs from that sid's own chunk directory via
+    ``_next_chunk_seq``. ``save()`` already handles an empty manifest: it seals
+    from index 0 with a disk-derived seq.
+
+    Chunk files are never copied, moved, or deleted here. The old sid's chunks
+    stay exactly where they are, still referenced by the old sid's own head.
+    """
+    s.session_id = sid
+    s._message_chunks = _normalised_manifest(manifest)
+    s._disk_identity_seen = None
+    s._disk_msg_count = None
+
+
 def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
     """Persist old_sid as a read-only pre-compression snapshot.
 
@@ -4927,9 +4971,29 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
         return
     try:
         existing_text = old_path.read_text(encoding='utf-8')
+        existing_manifest = None
         try:
             existing = json.loads(existing_text)
-            existing_msgs = len(existing.get('messages') or [])
+            # A segmented head's `messages` holds only the TAIL; the sealed
+            # chunks hold the rest, and their counts are in the manifest in this
+            # same head. Counting the tail made this a comparison between a
+            # total (memory) and a tail (disk), so `len(s.messages) >
+            # existing_msgs` fired for every segmented session -- including when
+            # memory held FEWER messages than disk, and the branch it guards
+            # OVERWRITES the archived transcript from memory.
+            existing_manifest = existing.get('message_chunks')
+            existing_msgs = (len(existing.get('messages') or [])
+                             + _sealed_total(existing_manifest))
+            # ...and never less than what the head CLAIMS. The two agree for
+            # every head this code writes, so this is normally a no-op; it
+            # matters only when part of the history cannot be counted from the
+            # file (a malformed manifest entry, which `_sealed_total` skips).
+            # Erring high only costs a snapshot that keeps its larger on-disk
+            # transcript; erring low replaces it with memory. Same reasoning,
+            # and same shape, as the #1558 guard in Session.save.
+            _claimed = _parse_nonnegative_int(existing.get('message_count'))
+            if _claimed is not None and _claimed > existing_msgs:
+                existing_msgs = _claimed
             existing_snapshot = bool(existing.get('pre_compression_snapshot'))
         except (json.JSONDecodeError, ValueError):
             # Treat corrupt/malformed old JSON as missing history and rewrite it
@@ -4944,7 +5008,11 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             saved_sid = s.session_id
             saved_snapshot = bool(getattr(s, 'pre_compression_snapshot', False))
             saved_pinned = bool(getattr(s, 'pinned', False))
-            s.session_id = old_sid
+            # NOT `s.session_id = old_sid`: this object's sealed-chunk manifest
+            # and cached on-disk count describe the CONTINUATION's file. Hand
+            # the retarget the manifest we just read out of old_sid's own head
+            # instead -- see _retarget_session_sidecar.
+            _retarget_session_sidecar(s, old_sid, manifest=existing_manifest)
             s.pre_compression_snapshot = True
             s.pinned = False
             # Stage-359 / PR #2295: clear runtime stream-state fields on the
@@ -4973,7 +5041,12 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
                     old_sid, len(s.messages),
                 )
             finally:
-                s.session_id = saved_sid
+                # The save above left old_sid's manifest and on-disk count on
+                # this object. Restoring the continuation id has to drop them for
+                # the same reason the retarget above did: the very next
+                # continuation save would otherwise write a saved_sid head naming
+                # chunk files that only exist under old_sid.msgs.
+                _retarget_session_sidecar(s, saved_sid)
                 s.pre_compression_snapshot = saved_snapshot
                 s.pinned = saved_pinned
                 s.active_stream_id = saved_active_stream_id
@@ -10961,7 +11034,15 @@ def _run_agent_streaming(
                     new_sid = _agent_sid
                     _compression_origin_session_id = old_sid
                     _compression_continuation_session_id = new_sid
-                    s.session_id = new_sid
+                    # The same retarget hazard as in
+                    # _preserve_pre_compression_snapshot, in the other direction:
+                    # this object's manifest and cached on-disk count describe
+                    # old_sid.json. It matters here on its own, not only via the
+                    # helper below -- when old_sid.json is absent the helper
+                    # returns immediately without touching anything, and the next
+                    # continuation save would then write a new_sid head naming
+                    # chunk files under old_sid.msgs.
+                    _retarget_session_sidecar(s, new_sid)
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
                     # session. On the next request, _run_agent_streaming calls
