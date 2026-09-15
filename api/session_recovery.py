@@ -36,6 +36,7 @@ import threading
 from contextlib import closing
 from pathlib import Path
 
+from api.models import _sealed_total
 from api.turn_journal import (
     derive_turn_journal_states,
     is_terminal_turn_event,
@@ -86,7 +87,31 @@ def _msg_count(p: Path) -> int:
     if not isinstance(data, dict):
         return -1
     msgs = data.get('messages')
-    return len(msgs) if isinstance(msgs, list) else -1
+    if not isinstance(msgs, list):
+        return -1
+    # A segmented sidecar keeps only the TAIL in `messages`; the rest lives in
+    # sealed chunk files whose counts are recorded in the manifest -- which is in
+    # this same head. Counting the tail alone would make every segmented session
+    # look like it had lost its history, and it does not merely under-report: it
+    # INVERTS the comparison this number feeds. A healthy 30-message segmented
+    # file (26 sealed + a 4-message tail) beside a stale unsegmented 10-message
+    # .bak reads as 4 < 10, so the boot-time sweep restores the SMALLER .bak over
+    # the good session -- 30 messages replaced by 10, automatically, with no user
+    # action. Measured on this branch before the fix:
+    #   "recover_session: restored r6.json from .bak (live=4 -> bak=10 messages)"
+    #
+    # Deliberately NOT reading the chunk files: that would put the per-boot cost
+    # this design removes straight back, and the counts are already here.
+    # `_sealed_total` is the one implementation of this sum (api/models.py); it
+    # returns 0 for a missing or malformed manifest, so an unsegmented head and a
+    # corrupt manifest both fall back to the tail. Erring low for a manifest that
+    # cannot be counted is the safe side here: it keeps the .bak eligible to win.
+    #
+    # The "torn file -> -1" contract above is untouched, and is why the manifest
+    # is read from the head rather than from anywhere else: a head that will not
+    # parse yields no manifest either, so a truncated live file still reads as -1
+    # and its .bak can still win.
+    return len(msgs) + _sealed_total(data.get('message_chunks'))
 
 
 def _rebuild_recovery_session_index(session_dir: Path) -> None:
