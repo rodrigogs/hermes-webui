@@ -274,3 +274,30 @@ def test_seal_chunk_refuses_to_clobber_an_existing_file(session_store):
 
     assert result is None
     assert path.read_bytes() == before, "an already-occupied seq must not be overwritten"
+
+
+# ── known hole: memory is trusted about what is already sealed on disk ──────
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known hole, the fourth instance of in-memory state used as the "
+    "authority for something whose truth is on disk (after: seq allocation, "
+    "and the two already fixed in this task's earlier rounds). "
+    "`_tail = self.messages[_sealed_n:]` trusts self.messages about what is "
+    "already sealed. Once an object has sealed, truncating self.messages "
+    "below the sealed count and saving leaves the head still naming every "
+    "sealed chunk (message_chunks unchanged, tail now []), so a reload "
+    "concatenates the untouched sealed chunks back in front of nothing and "
+    "resurrects the truncated messages instead of applying the truncation. "
+    "Task 4 (_manifest_matches_memory + re-seal-from-memory) fixes this; "
+    "remove this xfail marker when Task 4 lands."
+))
+def test_truncating_below_the_sealed_count_does_not_silently_revert(session_store):
+    s = _sess(session_store, "w16", _msgs(0, 30))
+    s.save()
+    assert M._sealed_total(s._message_chunks) == 26  # same live object: save() set this itself
+
+    s.messages = s.messages[:8]  # truncate below the sealed prefix
+    s.save()
+
+    reloaded = M.Session.load("w16")
+    assert len(reloaded.messages) == 8, "the truncation must survive a reload, not be reverted by it"

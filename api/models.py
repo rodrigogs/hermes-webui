@@ -4608,17 +4608,27 @@ def _next_chunk_seq(sid):
 def _seal_chunk(sid, seq, msgs, first_idx):
     """Write one immutable chunk and return its manifest entry, or None.
 
-    tmp + fsync + rename inside the chunk dir, so a reader never sees a partial
-    chunk. The caller writes the head only after this returns an entry -- see
-    the ordering argument in Session.save.
+    tmp + fsync + a create-if-absent link inside the chunk dir, so a reader
+    never sees a partial chunk. The caller writes the head only after this
+    returns an entry -- see the ordering argument in Session.save.
+
+    The create-if-absent step matters under concurrency: _next_chunk_seq's
+    disk scan and this function's write are not atomic together, so two
+    threads/processes can compute the same seq and both pass the `exists()`
+    pre-check below. `os.link` gives the two racers a single kernel-level
+    decision instead: the directory entry can only be created once, so the
+    loser gets FileExistsError and returns None cleanly rather than
+    os.replace()-ing over the winner's chunk -- which would leave the head
+    (written by whichever of the two saves runs last) naming a sha256 that no
+    longer matches the file on disk.
     """
     path = _chunk_path(sid, seq)
     if path is None:
         return None
     if path.exists():
-        # Belt and braces on top of _next_chunk_seq: a caller that hands us a
-        # seq already on disk is a bug, and the one thing this function must
-        # never do is silently overwrite an immutable chunk.
+        # Not load-bearing for correctness (the os.link below is what actually
+        # prevents a clobber) -- this just turns the common, non-racing case
+        # of a caller bug into a clear log line instead of an exception path.
         logger.error('sidecar chunk seal refused for %s seq %s: %s already exists', sid, seq, path.name)
         return None
     body = {'session_id': sid, 'seq': int(seq), 'first_idx': int(first_idx),
@@ -4635,7 +4645,6 @@ def _seal_chunk(sid, seq, msgs, first_idx):
             f.write(raw)
             f.flush()
             os.fsync(f.fileno())
-        _safe_replace(tmp, path)
     except OSError as exc:
         logger.error('sidecar chunk seal failed for %s seq %s: %s', sid, seq, exc)
         try:
@@ -4643,6 +4652,39 @@ def _seal_chunk(sid, seq, msgs, first_idx):
         except Exception:
             pass
         return None
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        logger.error('sidecar chunk seal lost a race for %s seq %s: %s already exists', sid, seq, path.name)
+        return None
+    except OSError as exc:
+        logger.error('sidecar chunk seal failed for %s seq %s: %s', sid, seq, exc)
+        return None
+    finally:
+        # The tmp file's job ends the moment the link either lands or fails --
+        # unlink it either way, so a race loser leaves nothing behind either.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    # fsync the DIRECTORY, not just the file: the write above fsyncs the
+    # chunk's bytes, but the chunk's directory ENTRY -- the thing that makes
+    # the name findable at all -- lives in the parent directory's own data and
+    # is a separate durability domain. Without this, a power loss can make the
+    # head (in a different directory, SESSION_DIR) durable while the link that
+    # is supposed to exist under it is lost, which is exactly the "manifest
+    # names a file that does not exist" case the write ordering in
+    # Session.save exists to prevent. Some platforms/filesystems refuse to
+    # fsync a directory fd; degrade to today's behaviour rather than fail the
+    # seal over it.
+    try:
+        _dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(_dir_fd)
+        finally:
+            os.close(_dir_fd)
+    except OSError:
+        pass
     return {'seq': int(seq), 'file': path.name, 'count': len(msgs),
             'first_idx': int(first_idx), 'sha256': _sha256_hex(raw)}
 
