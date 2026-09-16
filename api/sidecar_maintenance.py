@@ -1,7 +1,8 @@
 """Maintenance for segmented session sidecars: rollback and inspection.
 
 A storage format without a way back is a trap, so `unchunk_session` folds a
-segmented session into the single-file layout it had before segmenting.
+segmented session into the single-file layout it had before segmenting, and
+`unchunk_all` does the same for the whole store, one session at a time.
 `fsck_sessions` reports what is on disk and NEVER modifies it -- orphan
 chunks are expected after a crash or a re-seal, and deleting them
 automatically (even implicitly, even for chunks a successful unchunk just
@@ -155,6 +156,68 @@ def unchunk_session(sid) -> dict:
                 # fold already succeeded and must not be reported as failed
                 # because of this.
                 logger.debug('unchunk %s: chunk dir not removed (not empty?)', sid, exc_info=True)
+    return out
+
+
+def unchunk_all(session_dir=None) -> dict:
+    """Fold every segmented session back into one file. The whole-store rollback.
+
+    The work list comes from the DIRECTORY LISTING (`*.msgs`), never from
+    parsing heads: enumerating what to roll back must not cost what rolling it
+    back costs, and a `.msgs` directory is exactly the set of sessions that
+    have something to fold -- including the ones a `*.json` walk cannot see.
+
+    One session at a time, via `unchunk_session`, so the peak cost of the whole
+    store is the cost of its largest session and never a sum. Nothing is read
+    or held here beyond one directory listing.
+
+    A sid whose `<sid>.json` is absent is SKIPPED with a reason and left
+    completely alone. Archiving is a rename of the head, so "no head" means
+    either an archived session (whose chunks hold its history) or one that is
+    gone; there is nothing to fold into, and folding would either resurrect it
+    or write a file for a session that no longer exists.
+
+    A failure on one sid is reported and the walk continues. A rollback that
+    stops at the first problem leaves the store half-converted, which is worse
+    than either end state and invisible to the caller.
+
+    Returns ``{'unchunked': [sid, ...], 'skipped': [{'session_id', 'reason'}, ...]}``.
+    """
+    session_dir = session_dir or M.SESSION_DIR
+    out = {'unchunked': [], 'skipped': []}
+    # `unchunk_session` resolves its own paths under M.SESSION_DIR. Enumerating
+    # a DIFFERENT directory here would hand it session ids that name unrelated
+    # files in the live store -- and this function rewrites heads. Refuse per
+    # sid rather than silently fold the wrong ones.
+    wrong_dir = Path(session_dir) != Path(M.SESSION_DIR)
+    for d in sorted(session_dir.glob('*.msgs')):
+        if not d.is_dir():
+            continue
+        sid = d.name[:-len('.msgs')]
+        if not M.is_safe_session_id(sid):
+            out['skipped'].append({'session_id': sid, 'reason': 'unsafe session id in chunk dir name'})
+            continue
+        if wrong_dir:
+            out['skipped'].append({
+                'session_id': sid,
+                'reason': 'session_dir is not the active SESSION_DIR; unchunk_session writes only inside it',
+            })
+            continue
+        if not (M.SESSION_DIR / f'{sid}.json').exists():
+            out['skipped'].append({'session_id': sid, 'reason': 'head missing (archived or removed)'})
+            continue
+        try:
+            res = unchunk_session(sid)
+        except Exception as exc:
+            logger.error('unchunk_all: %s failed (%s)', sid, exc.__class__.__name__, exc_info=True)
+            out['skipped'].append({'session_id': sid, 'reason': f'failed ({exc.__class__.__name__})'})
+            continue
+        if res.get('unchunked'):
+            out['unchunked'].append(sid)
+        else:
+            # A refusal (an unreadable chunk, a torn head) or nothing to do.
+            # Either way `unchunk_session` changed nothing.
+            out['skipped'].append({'session_id': sid, 'reason': res.get('error') or 'nothing to fold'})
     return out
 
 

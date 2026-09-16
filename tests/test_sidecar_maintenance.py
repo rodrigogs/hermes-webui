@@ -7,7 +7,7 @@ from collections import OrderedDict
 import pytest
 
 import api.models as M
-from api.sidecar_maintenance import fsck_sessions, unchunk_session
+from api.sidecar_maintenance import fsck_sessions, unchunk_all, unchunk_session
 
 
 @pytest.fixture
@@ -255,3 +255,52 @@ def test_unchunk_leaves_a_chunk_alone_when_the_bak_shares_it(session_store):
     restored = M.Session.load("m8")
     assert not restored._chunk_read_incomplete, restored._chunk_read_incomplete
     assert len(restored.messages) == 30
+
+
+def test_unchunk_all_folds_every_segmented_session_and_skips_an_archived_one(session_store):
+    """The rollback path for the whole store, one session at a time.
+
+    Fails if the work list comes from anywhere but the `.msgs` directories --
+    a `*.json` walk cannot see an archived session at all, and parsing every
+    head to find the work costs exactly what the rollback is trying to avoid
+    -- or if a session whose head is missing gets folded anyway: there is
+    nothing to fold into, and an archived session must be neither resurrected
+    nor stripped of the chunks that hold its history.
+    """
+    for sid in ("n1", "n2", "n3"):
+        _segmented(session_store, sid, n=22)
+    _segmented(session_store, "n4", n=22)
+    (session_store / "n4.json").rename(session_store / "n4.json.archived")
+    archived_chunks = sorted(p.name for p in (session_store / "n4.msgs").glob("*.json"))
+    assert archived_chunks, "the archived session must still have chunks, or this proves nothing"
+
+    out = unchunk_all(session_store)
+
+    assert sorted(out["unchunked"]) == ["n1", "n2", "n3"]
+    for sid in ("n1", "n2", "n3"):
+        doc = json.loads((session_store / f"{sid}.json").read_bytes())
+        assert not doc.get("message_chunks")
+        assert [m["content"] for m in doc["messages"]] == [f"m{i}" for i in range(22)]
+        assert not (session_store / f"{sid}.msgs").exists()
+    assert [r["session_id"] for r in out["skipped"]] == ["n4"]
+    assert "head" in out["skipped"][0]["reason"], out["skipped"]
+    assert sorted(p.name for p in (session_store / "n4.msgs").glob("*.json")) == archived_chunks
+
+
+def test_unchunk_all_keeps_going_after_a_session_it_cannot_fold(session_store):
+    """One unfoldable session must not strand every session after it.
+
+    The torn head sorts FIRST on purpose: fails if a per-session failure
+    propagates out of the loop or returns early, because then n6 is still
+    segmented and the store is half rolled back with no report saying so.
+    """
+    _segmented(session_store, "n5", n=22)
+    _segmented(session_store, "n6", n=22)
+    (session_store / "n5.json").write_text('{"session_id": "n5", "messages": [', encoding="utf-8")
+
+    out = unchunk_all(session_store)
+
+    assert out["unchunked"] == ["n6"]
+    assert [r["session_id"] for r in out["skipped"]] == ["n5"]
+    assert not json.loads((session_store / "n6.json").read_bytes()).get("message_chunks")
+    assert (session_store / "n5.msgs").exists(), "a refusal must leave the chunks alone"
