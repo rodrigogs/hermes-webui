@@ -11,6 +11,7 @@ of those is exactly what makes that `.bak` unrestorable. An earlier round on
 this branch proved it: doing so turned a 30-message `.bak` into a 4-message
 one.
 """
+import hashlib
 import json
 import logging
 import os
@@ -157,7 +158,49 @@ def unchunk_session(sid) -> dict:
     return out
 
 
-def fsck_sessions(session_dir=None) -> dict:
+def _chunk_dir_footprint(d) -> tuple[int, int]:
+    """``(files, bytes)`` for one chunk directory, from `os.stat` alone.
+
+    Never opens a chunk. The operator runs these helpers INSIDE the container
+    so the environment matches, and one directory on the deployed box holds the
+    bulk of a 203 MB session; describing it must not allocate it.
+    """
+    files = total = 0
+    try:
+        entries = list(os.scandir(d))
+    except OSError:
+        return (0, 0)
+    for e in entries:
+        try:
+            if e.is_file():
+                files += 1
+                total += e.stat().st_size
+        except OSError:
+            continue  # vanished mid-walk; a report must not fail over one file
+    return (files, total)
+
+
+def _chunk_sha256(path, block=1024 * 1024) -> str | None:
+    """sha256 of one chunk, fed the file a megabyte at a time. None if unreadable.
+
+    Blockwise, not `read_bytes()`: the whole point of `verify=True` being opt-in
+    is that it stays bounded when it IS asked for. A chunk is only as small as
+    the tail limits made it, and this runs on a 5.9 GiB VM with no swap.
+    """
+    h = hashlib.sha256()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                buf = f.read(block)
+                if not buf:
+                    break
+                h.update(buf)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def fsck_sessions(session_dir=None, *, verify=False) -> dict:
     """Report segmented sidecars, their integrity, and orphan chunks.
 
     Read-only by design: nothing here writes, unlinks, or truncates anything.
@@ -165,6 +208,21 @@ def fsck_sessions(session_dir=None) -> dict:
     chunk and writing the head, and of every re-seal (which orphans the old
     chunks ON PURPOSE, per `Session.save`) -- it is a thing to report, not to
     reap.
+
+    BOUNDED BY DEFAULT. Each head is parsed once and each manifest entry is
+    checked with `os.stat`: a missing chunk is reported, a present one is
+    accepted. No chunk is read. The previous version called
+    `_read_sidecar_document` per head, which reads, sha256-es and
+    `json.loads`-es every chunk of every session -- on the deployed box (5.9
+    GiB, no swap, one archived head of 203,876,949 bytes) that is precisely
+    the allocation that got the webui OOM-killed twice. `verify=True` asks for
+    the expensive half: each chunk is additionally hashed a megabyte at a time
+    and compared against the manifest's `sha256`. So the default answers "is
+    anything the manifest names gone?" and `verify=True` answers "and does
+    what is there still match?".
+
+    `total_messages` is therefore what the HEAD describes -- the counts its
+    manifest claims plus the tail it carries -- not a reassembled count.
 
     Orphan detection consults BOTH the live head's manifest and its `.bak`'s
     manifest (when a `.bak` exists) before calling a chunk file orphaned: a
@@ -181,28 +239,82 @@ def fsck_sessions(session_dir=None) -> dict:
     outlive its head (e.g. a crash after the head was removed but before its
     chunk directory was), and such a directory's entire contents would be
     invisible to a walk that only ever looks at heads.
+
+    A directory whose `<sid>.json` is gone is NOT reported as orphan files.
+    The operator archives a session by RENAMING its head to
+    `<sid>.json.archived` (one such file is on the deployed box), so a
+    `<sid>.json.*` sibling means the session is archived, its chunks still
+    hold its history, and they belong under `archived_chunk_dirs`. Only when
+    no sibling exists at all is the directory headless
+    (`headless_chunk_dirs`). Both are reported as ONE row per directory, from
+    `os.stat`: an archived session can have thousands of chunks, and thousands
+    of orphan lines describe one decision as if it were thousands.
     """
     session_dir = session_dir or M.SESSION_DIR
-    report = {'sessions': [], 'orphans': [], 'errors': []}
+    report = {'sessions': [], 'orphans': [], 'headless_chunk_dirs': [],
+              'archived_chunk_dirs': [], 'errors': []}
     referenced_by_sid: dict[str, set] = {}
     for head in sorted(session_dir.glob('*.json')):
         if head.name.startswith('_'):
             continue
         sid = head.stem
-        doc = M._read_sidecar_document(head, sid)
         live_referenced = set()
-        if doc is None:
+        chunk_dir = M._session_chunk_dir(sid)
+        try:
+            doc = json.loads(head.read_bytes())
+        # Not a bare `except`: the biggest live head on the deployed box is
+        # ~200 MB, so a MemoryError here is a real event, and reporting it as
+        # "head unreadable" would send the operator looking for corruption --
+        # possibly at a `.bak` -- over a transient allocation failure. Let it
+        # escape; only "could not open it" and "not JSON" are findings.
+        except (OSError, ValueError):
+            doc = None
+        if not isinstance(doc, dict):
             report['errors'].append({'session_id': sid, 'error': 'head unreadable'})
+        elif chunk_dir is None:
+            report['errors'].append({'session_id': sid, 'error': 'unsafe session id; chunks not checked'})
         else:
-            manifest = M._normalised_manifest(doc.get('message_chunks'))
+            raw_manifest = doc.get('message_chunks')
+            manifest = M._normalised_manifest(raw_manifest)
             live_referenced = {e['file'] for e in manifest}
             if manifest:
+                errors = []
+                # Same visibility `_read_sidecar_document` owes a reader: a
+                # manifest whose entries stop chaining describes a hole, and the
+                # dropped tail must not vanish from the report just because the
+                # prefix normalised cleanly.
+                dropped = len(raw_manifest) - len(manifest) if isinstance(raw_manifest, list) else 0
+                if dropped:
+                    errors.append(f'manifest truncated after {len(manifest)} of {len(raw_manifest)} '
+                                  f'entries: continuity broke or an entry was malformed')
+                for entry in manifest:
+                    fname = entry['file']
+                    # The manifest is read off disk, not generated -- refuse
+                    # anything that is not a bare filename before joining it.
+                    if Path(fname).name != fname:
+                        errors.append(f'{fname}: refused, not a plain chunk filename')
+                        continue
+                    f = chunk_dir / fname
+                    try:
+                        os.stat(f)
+                    except FileNotFoundError:
+                        errors.append(f'{fname}: missing')
+                        continue
+                    except OSError as exc:
+                        errors.append(f'{fname}: unstattable ({exc.__class__.__name__})')
+                        continue
+                    if verify:
+                        digest = _chunk_sha256(f)
+                        if digest is None:
+                            errors.append(f'{fname}: unreadable')
+                        elif digest != entry['sha256']:
+                            errors.append(f'{fname}: sha256 mismatch')
                 report['sessions'].append({
                     'session_id': sid,
                     'chunks': len(manifest),
-                    'total_messages': len(doc.get('messages') or []),
+                    'total_messages': M._sealed_total(manifest) + len(doc.get('messages') or []),
                     'claimed_messages': doc.get('message_count'),
-                    'errors': list(doc.get('chunk_errors') or []),
+                    'errors': errors,
                 })
         bak_referenced, bak_err = _bak_manifest_files(head)
         if bak_err:
@@ -218,6 +330,19 @@ def fsck_sessions(session_dir=None) -> dict:
         sid = d.name[:-len('.msgs')]
         if not M.is_safe_session_id(sid):
             report['errors'].append({'session_id': sid, 'error': 'unsafe session id in chunk dir name'})
+            continue
+        if not (session_dir / f'{sid}.json').exists():
+            files, nbytes = _chunk_dir_footprint(d)
+            row = {'session_id': sid, 'files': files, 'bytes': nbytes}
+            # A `<sid>.json.*` sibling (`.archived`, `.bak`, `.bak.archived`...)
+            # means a head still exists under another name -- archiving IS a
+            # rename here -- so these chunks are that session's history, not
+            # residue. Calling them orphans invites the one action that loses
+            # it. Only a directory with no sibling at all is truly headless.
+            if any(session_dir.glob(f'{sid}.json.*')):
+                report['archived_chunk_dirs'].append(row)
+            else:
+                report['headless_chunk_dirs'].append(row)
             continue
         referenced = referenced_by_sid.get(sid, set())
         for f in sorted(d.glob('*.json')):
