@@ -370,8 +370,17 @@ def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
     )
     assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
     delete_block = routes_src[delete_idx:delete_idx+2400]
-    assert "with_suffix('.json.bak').unlink" in delete_block or 'with_suffix(".json.bak").unlink' in delete_block, \
-        "session/delete must unlink <sid>.json.bak to avoid later orphan-backup recovery"
+    # The handler used to unlink the .bak inline. With segmented sidecars it
+    # removes head, .json.bak AND the sealed chunk directory through one helper,
+    # api.models._remove_session_files -- whose .bak removal is asserted by
+    # tests/test_sidecar_chunk_delete.py::test_remove_session_files_removes_head_bak_and_chunk_dir.
+    # Either spelling satisfies this guard; a handler that does neither has
+    # stopped removing the backup.
+    assert (
+        "_remove_session_files(sid)" in delete_block
+        or "with_suffix('.json.bak').unlink" in delete_block
+        or 'with_suffix(".json.bak").unlink' in delete_block
+    ), "session/delete must remove <sid>.json.bak to avoid later orphan-backup recovery"
 
 # ── R9: Token/tool SSE events write to wrong session after switch ─────────────
 
