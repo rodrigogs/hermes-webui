@@ -22,6 +22,38 @@ import api.models as M
 logger = logging.getLogger(__name__)
 
 
+def _bak_manifest_files(head) -> tuple[set, str | None]:
+    """Chunk filenames the sibling ``<head>.bak`` manifest still references.
+
+    ONE definition of "still referenced by the .bak", shared by both
+    `unchunk_session` (which must not delete a file this returns) and
+    `fsck_sessions` (which must not call a file this returns an orphan). Two
+    near-identical loops computing this independently is exactly how the two
+    functions drifted: `fsck_sessions` cross-checked the `.bak` from the
+    start, `unchunk_session` did not, and the gap was invisible until a
+    tail-only shrink (the ORDINARY case -- it does not force a re-seal) left
+    the live head and the `.bak` naming the SAME sealed chunk file.
+
+    Returns ``(files, error)``. ``error`` is ``None`` when there is no
+    `.bak`, or one exists and parses; it carries a message when a `.bak`
+    EXISTS but could not be read or parsed. A caller must not treat "no
+    `.bak`" and "an unreadable `.bak`" the same way: the first means nothing
+    needs excluding, the second means a chunk's need cannot be RULED OUT and
+    must be treated as still referenced.
+    """
+    bak_path = head.with_suffix('.json.bak')
+    if not bak_path.exists():
+        return set(), None
+    try:
+        bak_doc = json.loads(bak_path.read_bytes())
+    except Exception as exc:
+        return set(), f'.bak unreadable ({exc.__class__.__name__})'
+    if not isinstance(bak_doc, dict):
+        return set(), '.bak did not parse to a JSON object'
+    manifest = M._normalised_manifest(bak_doc.get('message_chunks'))
+    return {e['file'] for e in manifest}, None
+
+
 def unchunk_session(sid) -> dict:
     """Fold a segmented session back into one file. Idempotent.
 
@@ -36,13 +68,18 @@ def unchunk_session(sid) -> dict:
     a "complete" file that silently disagrees with what was checked.
 
     Chunk cleanup removes only the FILES named in the manifest that was just
-    folded, one at a time, and removes the directory only once it is empty.
-    A blind `rmtree` of the whole `.msgs` directory would also destroy any
-    OTHER file sitting in it -- most importantly an orphan that only this
-    session's `.bak` still references (see module docstring). Any such
-    leftover simply keeps the directory (and itself) on disk; that is not a
-    failure of unchunking, which has already succeeded once the head is
-    rewritten to hold everything.
+    folded, one at a time, MINUS any of those filenames the sibling `.bak`
+    still references (via `_bak_manifest_files`) -- and removes the
+    directory only once it is empty. A blind `rmtree` of the whole `.msgs`
+    directory, or removing every live-manifest filename without the `.bak`
+    check, would destroy a chunk the `.bak` needs: a tail-only shrink does
+    NOT force a re-seal, so the live head and the `.bak` routinely name the
+    exact SAME sealed chunk file, not just different ones. If the `.bak`
+    can't be read at all, nothing named in the live manifest is removed --
+    an unreadable `.bak` means its needs cannot be ruled out, not that it has
+    none. Any file left behind this way simply keeps the directory (and
+    itself) on disk; that is not a failure of unchunking, which has already
+    succeeded once the head is rewritten to hold everything.
     """
     out = {'session_id': sid, 'unchunked': False, 'messages': 0, 'removed_chunks': 0}
     if not M.is_safe_session_id(sid):
@@ -83,26 +120,40 @@ def unchunk_session(sid) -> dict:
     out['unchunked'] = True
     d = M._session_chunk_dir(sid)
     if d is not None and d.is_dir():
-        removed = 0
-        for entry in manifest:
-            fname = entry.get('file')
-            if not fname or Path(fname).name != fname:
-                continue  # never touch anything that isn't a plain chunk filename
+        bak_referenced, bak_err = _bak_manifest_files(head)
+        if bak_err:
+            # Cannot rule out the .bak needing one of these files -- remove
+            # NONE of them rather than guess. The fold already succeeded;
+            # only cleanup is skipped.
+            logger.error('unchunk %s: not removing any chunk file -- %s; its needs could not be ruled out',
+                          sid, bak_err)
+        else:
+            removed = 0
+            for entry in manifest:
+                fname = entry.get('file')
+                if not fname or Path(fname).name != fname:
+                    continue  # never touch anything that isn't a plain chunk filename
+                if fname in bak_referenced:
+                    # The .bak's manifest still names this exact file -- a
+                    # tail-only shrink does not force a re-seal, so the live
+                    # head and the .bak can share a sealed chunk. Removing it
+                    # would make that .bak unrestorable. Leave it.
+                    continue
+                try:
+                    (d / fname).unlink()
+                    removed += 1
+                except OSError:
+                    logger.debug('unchunk %s: could not remove chunk %s', sid, fname, exc_info=True)
+            out['removed_chunks'] = removed
             try:
-                (d / fname).unlink()
-                removed += 1
+                d.rmdir()
             except OSError:
-                logger.debug('unchunk %s: could not remove chunk %s', sid, fname, exc_info=True)
-        out['removed_chunks'] = removed
-        try:
-            d.rmdir()
-        except OSError:
-            # Not empty -- an orphan the manifest never named (a crash
-            # residue, a re-seal residue, or a `.bak`'s referent) is
-            # deliberately left alone -- or some other best-effort failure.
-            # Either way the fold already succeeded and must not be reported
-            # as failed because of this.
-            logger.debug('unchunk %s: chunk dir not removed (not empty?)', sid, exc_info=True)
+                # Not empty -- a chunk the .bak still needs, an orphan the
+                # manifest never named (a crash residue or a re-seal
+                # residue), or some other best-effort failure. Either way the
+                # fold already succeeded and must not be reported as failed
+                # because of this.
+                logger.debug('unchunk %s: chunk dir not removed (not empty?)', sid, exc_info=True)
     return out
 
 
@@ -153,19 +204,12 @@ def fsck_sessions(session_dir=None) -> dict:
                     'claimed_messages': doc.get('message_count'),
                     'errors': list(doc.get('chunk_errors') or []),
                 })
-        bak_referenced = set()
-        bak_path = head.with_suffix('.json.bak')
-        if bak_path.exists():
-            try:
-                bak_doc = json.loads(bak_path.read_bytes())
-                if isinstance(bak_doc, dict):
-                    bak_referenced = {e['file'] for e in
-                                       M._normalised_manifest(bak_doc.get('message_chunks'))}
-            except Exception:
-                report['errors'].append({
-                    'session_id': sid,
-                    'error': '.bak unreadable; its chunks could not be excluded from orphan detection',
-                })
+        bak_referenced, bak_err = _bak_manifest_files(head)
+        if bak_err:
+            report['errors'].append({
+                'session_id': sid,
+                'error': f'{bak_err}; its chunks could not be excluded from orphan detection',
+            })
         referenced_by_sid[sid] = live_referenced | bak_referenced
 
     for d in sorted(session_dir.glob('*.msgs')):

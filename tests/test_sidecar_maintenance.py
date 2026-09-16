@@ -1,5 +1,6 @@
 """Rollback and inspection. A storage format without a way back is a trap."""
 import json
+import shutil
 from collections import OrderedDict
 
 import pytest
@@ -82,3 +83,69 @@ def test_fsck_reports_a_corrupted_chunk(session_store):
     rep = fsck_sessions(session_store)
     row = next(r for r in rep["sessions"] if r["session_id"] == "m6")
     assert any("sha256" in e for e in row["errors"])
+
+
+def test_unchunk_leaves_a_bak_only_chunk_alone_after_a_reseal(session_store):
+    """Differing-manifest case: a shrink big enough to eat into the sealed
+    prefix forces a re-seal, so the live head ends up naming a NEW chunk
+    while the `.bak` this same save just wrote still names the OLD one.
+    unchunk_session must not delete a chunk its own `.bak` still needs, even
+    though the live manifest no longer names it.
+    """
+    p = _segmented(session_store, "m7", n=22)
+    s = M.Session.load("m7")
+    assert len(s.messages) == 22
+    s.messages = _msgs(6)  # shrinks below the sealed 18 -> forces a re-seal
+    s.save()
+    bak = session_store / "m7.json.bak"
+    assert bak.exists()
+    bak_manifest = json.loads(bak.read_bytes())["message_chunks"]
+    bak_files = {e["file"] for e in bak_manifest}
+    assert bak_files, "the .bak must claim at least one sealed chunk for this test to mean anything"
+
+    out = unchunk_session("m7")
+    assert out["unchunked"] is True and out["messages"] == 6
+
+    chunk_dir = session_store / "m7.msgs"
+    for fname in bak_files:
+        assert (chunk_dir / fname).exists(), f"{fname} is needed by m7.json.bak"
+
+    # Restoring the .bak must still recover the full pre-shrink history.
+    shutil.copyfile(bak, p)
+    restored = M.Session.load("m7")
+    assert not restored._chunk_read_incomplete, restored._chunk_read_incomplete
+    assert len(restored.messages) == 22
+
+
+def test_unchunk_leaves_a_chunk_alone_when_the_bak_shares_it(session_store):
+    """Shared-chunk case: a tail-only shrink does NOT force a re-seal (the
+    sealed prefix is untouched), so the live head and its `.bak` can name
+    the exact SAME sealed chunk file. unchunk_session must not delete a
+    chunk its own `.bak` still needs, even though the LIVE manifest
+    (correctly, for the live head's own purposes) names it too.
+    """
+    p = _segmented(session_store, "m8", n=30)
+    s = M.Session.load("m8")
+    assert len(s.messages) == 30
+    s.messages = s.messages[:-2]  # tail-only shrink: 30 -> 28, no re-seal
+    s.save()
+    bak = session_store / "m8.json.bak"
+    assert bak.exists()
+    bak_manifest = json.loads(bak.read_bytes())["message_chunks"]
+    bak_files = {e["file"] for e in bak_manifest}
+    live_manifest = json.loads(p.read_bytes())["message_chunks"]
+    live_files = {e["file"] for e in live_manifest}
+    assert bak_files == live_files, "this test only means something when live and .bak share a chunk"
+
+    out = unchunk_session("m8")
+    assert out["unchunked"] is True and out["messages"] == 28
+
+    chunk_dir = session_store / "m8.msgs"
+    for fname in bak_files:
+        assert (chunk_dir / fname).exists(), f"{fname} is needed by m8.json.bak"
+
+    # Restoring the .bak must still recover the full pre-shrink history.
+    shutil.copyfile(bak, p)
+    restored = M.Session.load("m8")
+    assert not restored._chunk_read_incomplete, restored._chunk_read_incomplete
+    assert len(restored.messages) == 30
