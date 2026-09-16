@@ -142,7 +142,15 @@ def test_torn_head_returns_none(session_store):
 
 def test_manifest_entry_with_path_traversal_filename_is_refused(session_store):
     """A hand-edited or corrupted head can name a `file` outside the chunk
-    dir. It must be refused before it is ever opened, not silently followed."""
+    dir. It must be refused before it is ever opened, not silently followed.
+
+    The refusal now happens one layer earlier: `_normalised_manifest` requires
+    a name its own writer could have produced, so the entry never reaches the
+    read loop and every OTHER consumer of the manifest inherits the same
+    rejection. The reported message therefore names the position in the
+    manifest rather than the filename; the guard in the read loop stays as
+    defence in depth for a manifest that did not come through here.
+    """
     c1 = _write_chunk(session_store, "s10", 1, _msgs(0, 2), 0)
     # A decoy outside the chunk dir: if the guard were missing, this is what a
     # "../" escape would read instead of refusing the entry.
@@ -154,7 +162,7 @@ def test_manifest_entry_with_path_traversal_filename_is_refused(session_store):
     out = M._read_sidecar_document(p, "s10")
 
     assert [m["content"] for m in out["messages"]] == ["m2"], "decoy never read; rest of session still loads"
-    assert any("../escape.json" in e for e in out["chunk_errors"])
+    assert any("malformed" in e for e in out["chunk_errors"]), out["chunk_errors"]
 
 
 def test_manifest_truncation_from_broken_continuity_is_reported(session_store):

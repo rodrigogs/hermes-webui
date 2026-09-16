@@ -4703,6 +4703,13 @@ def _normalised_manifest(raw):
     manifest whose entries do not chain describes a hole, and the only safe
     reading of a hole is "the sealed prefix ends before it". Silently skipping
     it would renumber every later message.
+
+    `file` must be a name this module's writer could have produced
+    (`_CHUNK_FILENAME_RE`), and an entry that fails that truncates the prefix
+    exactly like a hole does. It is checked HERE so every consumer inherits it:
+    `file: ""` in particular passed the "is it a bare filename?" guards in
+    `_read_sidecar_document` and `api/streaming.py` (`Path('').name == ''`),
+    and `chunk_dir / ''` is the chunk DIRECTORY, which exists and opens.
     """
     if not isinstance(raw, list):
         return []
@@ -4715,6 +4722,8 @@ def _normalised_manifest(raw):
         if not isinstance(entry.get('first_idx'), int) or entry['count'] < 0:
             break
         if not isinstance(entry.get('file'), str) or not isinstance(entry.get('sha256'), str):
+            break
+        if not _CHUNK_FILENAME_RE.match(entry['file']):
             break
         if entry['first_idx'] != running:
             break

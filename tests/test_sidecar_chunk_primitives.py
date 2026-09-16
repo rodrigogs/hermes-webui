@@ -87,6 +87,30 @@ def test_normalised_manifest_drops_entries_that_break_continuity():
     assert M._normalised_manifest([a, b, bad, c]) == [a, b]
 
 
+def test_normalised_manifest_truncates_at_a_filename_that_is_not_a_chunk_name():
+    """`file: ""` is the one that gets past every downstream guard.
+
+    `Path('').name == ''`, so the "is it a bare filename?" checks in
+    `_read_sidecar_document` and `api/streaming.py` both accept it, and
+    `chunk_dir / ''` is the DIRECTORY -- which exists, opens, and is not what
+    anyone meant to read. Rejecting it here means every consumer inherits the
+    rejection instead of each needing its own guard.
+
+    Fails if `_normalised_manifest` stops requiring `_CHUNK_FILENAME_RE`: the
+    empty name (and `../x.json`) is then part of the normalised prefix, so the
+    entries AFTER it are trusted too, and every count and `first_idx` past the
+    bad entry is taken from a file nobody could read.
+    """
+    a = {"seq": 1, "file": "000001.json", "count": 2, "first_idx": 0, "sha256": "x"}
+    for bad_name in ("", "../x.json", "/etc/passwd", "000002.txt", "1.json", "000002.json.bak"):
+        bad = {"seq": 2, "file": bad_name, "count": 2, "first_idx": 2, "sha256": "y"}
+        after = {"seq": 3, "file": "000003.json", "count": 1, "first_idx": 4, "sha256": "z"}
+        assert M._normalised_manifest([a, bad, after]) == [a], f"{bad_name!r} must truncate the prefix"
+    # ...and a six-digit name is still accepted, or the guard would reject
+    # everything the writer produces.
+    assert M._normalised_manifest([a]) == [a]
+
+
 def test_tail_thresholds_have_the_documented_defaults():
     assert M._SIDECAR_TAIL_MAX_MSGS == 2000
     assert M._SIDECAR_TAIL_MAX_BYTES == 2 * 1024 * 1024
