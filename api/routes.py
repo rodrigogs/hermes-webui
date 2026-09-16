@@ -22389,7 +22389,26 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             if should_delete:
                 with LOCK:
                     SESSIONS.pop(p.stem, None)
-                p.unlink(missing_ok=True)
+                sid = p.stem
+                # Whole session going away here too (orphan/empty sweep), so
+                # its .bak and sealed chunk dir must go with the head --
+                # segmenting made the chunk dir the largest of the three.
+                # `is_safe_session_id` is already guaranteed by the
+                # `Session.load(p.stem)` call above (it returns None, making
+                # `should_delete` falsy, for any unsafe stem), so the else
+                # branch below should be unreachable today -- it is defense
+                # in depth so a future loosening of that gate still degrades
+                # to today's unlink-only behaviour instead of silently
+                # leaving the orphan behind.
+                if is_safe_session_id(sid):
+                    _remove_session_files(sid)
+                    try:
+                        from api.upload import _session_attachment_dir
+                        shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
+                    except Exception:
+                        logger.debug("Failed to clean attachment dir for orphan session %s", sid)
+                else:
+                    p.unlink(missing_ok=True)
                 cleaned += 1
                 phase1_removed_ids.add(p.stem)
         except Exception:
