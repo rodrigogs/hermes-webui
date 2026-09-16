@@ -208,6 +208,13 @@ def test_unchunk_leaves_a_bak_only_chunk_alone_after_a_reseal(session_store):
     bak_manifest = json.loads(bak.read_bytes())["message_chunks"]
     bak_files = {e["file"] for e in bak_manifest}
     assert bak_files, "the .bak must claim at least one sealed chunk for this test to mean anything"
+    live_files = {e["file"] for e in json.loads(p.read_bytes())["message_chunks"]}
+    assert bak_files != live_files, (
+        "this is the DIFFERING-manifest case: without a re-seal the live head and the .bak "
+        "name the same chunk, and the test silently becomes a duplicate of "
+        "test_unchunk_leaves_a_chunk_alone_when_the_bak_shares_it -- i.e. it stops covering "
+        "a chunk that ONLY the .bak still references, the one unchunk_session must not delete"
+    )
 
     out = unchunk_session("m7")
     assert out["unchunked"] is True and out["messages"] == 6

@@ -323,3 +323,34 @@ def test_a_public_message_chunks_attribute_cannot_displace_the_manifest(session_
     assert raw.count('"message_chunks"') == 1, "written once, by save(), not also by extra"
     assert raw.index('"message_chunks"') < raw.index('"messages"'), "and still in the cheap prefix"
     assert len(M.Session.load("w17").messages) == 31, "and the history is still reachable"
+
+
+def test_seal_chunk_that_loses_the_link_race_returns_none_and_leaves_no_tmp(session_store):
+    """The clobber guard that actually holds under concurrency.
+
+    `_next_chunk_seq`'s disk scan and this write are not atomic together, so
+    two savers can compute the same seq and BOTH pass the `exists()` pre-check
+    above it. `os.link` is the single kernel-level decision that makes one of
+    them lose, and the loser must return None: its caller would otherwise
+    os.replace() over the winner's chunk and then write a head naming a sha256
+    that no longer matches the bytes on disk. It must also leave nothing
+    behind, since a tmp file only disappears later, if the stale-tmp sweeper
+    runs.
+
+    Fails if the FileExistsError branch stops returning None (falling into the
+    replace, or letting the error escape into the caller's save), and fails if
+    the `finally` that unlinks the tmp file is dropped.
+    """
+    path = M._chunk_path("w18", 1)
+
+    def losing_link(src, dst, *a, **k):
+        raise FileExistsError(17, "File exists")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(M.os, "link", losing_link)
+        result = M._seal_chunk("w18", 1, _msgs(0, 3), 0)
+
+    assert result is None, "the race loser must not hand its caller a manifest entry"
+    assert path.parent.is_dir(), "the fixture must have got as far as creating the chunk dir"
+    assert sorted(p.name for p in path.parent.iterdir()) == [], \
+        "no chunk, and no *.tmp.* left for the stale-tmp sweeper to find later"
