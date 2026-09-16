@@ -72,7 +72,10 @@ def test_save_cost_does_not_scale_with_history(session_store, monkeypatch):
     s.messages = s.messages + [{"role": "user", "timestamp": 99999.0, "content": "one more"}]
     s.save()
 
-    total_size = len(json.dumps(msgs))
+    # What a FULL rewrite of this history costs, in the serialisation save()
+    # actually writes (indent=2, ensure_ascii=False -- compact json.dumps is
+    # ~6.6% smaller per message and would skew every number below).
+    total_size = len(json.dumps(msgs, ensure_ascii=False, indent=2).encode("utf-8"))
     # The cap must sit strictly BETWEEN what a bounded save writes (the tail --
     # _SIDECAR_TAIL_KEEP messages plus one appended, plus metadata) and what a
     # full rewrite writes (all 12,000), with margin on both sides -- not a
@@ -84,10 +87,20 @@ def test_save_cost_does_not_scale_with_history(session_store, monkeypatch):
     # it tracks both if either changes, instead of drifting out of meaning.
     # Measured on this fixture: a sealed grow-save writes ~156 KB; an
     # unsealed (full-rewrite) grow-save writes ~3,630 KB. This formula lands
-    # at ~702 KB -- about 4.5x above the sealed write and 5x below the full
+    # at ~750 KB -- about 4.8x above the sealed write and 4.7x below the full
     # rewrite.
     avg_msg_bytes = total_size / len(msgs)
     cap = avg_msg_bytes * (M._SIDECAR_TAIL_KEEP + 1) * 5 + 32 * 1024
+    # The cap is linear in _SIDECAR_TAIL_KEEP. Grow that constant ~5x and the
+    # cap climbs past this fixture's full rewrite, and the assertion below can
+    # no longer fail -- the silent disarm this test was rewritten to remove,
+    # via a different variable. So the test checks its own teeth first: if the
+    # cap stops separating the two regimes, fail HERE, loudly, instead of
+    # passing on a full rewrite. Grow the fixture when this trips.
+    assert cap * 2 < total_size, (
+        f"cap {cap:,.0f} is not well below this fixture's {total_size:,}-byte full "
+        f"rewrite; the test can no longer tell a sealed save from a full rewrite"
+    )
     assert written["n"] < cap, (
         f"a post-seal save wrote {written['n']:,} bytes (cap {cap:,.0f}) for a "
         f"{total_size:,}-byte history; sealing is not bounding the cost"
