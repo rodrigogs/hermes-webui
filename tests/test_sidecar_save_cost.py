@@ -73,8 +73,23 @@ def test_save_cost_does_not_scale_with_history(session_store, monkeypatch):
     s.save()
 
     total_size = len(json.dumps(msgs))
-    assert written["n"] < 4 * 1024 * 1024, (
-        f"a post-seal save wrote {written['n']:,} bytes for a "
+    # The cap must sit strictly BETWEEN what a bounded save writes (the tail --
+    # _SIDECAR_TAIL_KEEP messages plus one appended, plus metadata) and what a
+    # full rewrite writes (all 12,000), with margin on both sides -- not a
+    # fixed number chosen because it "looked reasonable" above both. A fixed
+    # 4 MiB cap against this fixture's ~3.14 MiB full-rewrite size left a
+    # regression to a full rewrite UNDER the cap, so the test could not fail
+    # on the exact thing it exists to catch. Deriving the cap from the
+    # fixture's own average message size and from `_SIDECAR_TAIL_KEEP` means
+    # it tracks both if either changes, instead of drifting out of meaning.
+    # Measured on this fixture: a sealed grow-save writes ~156 KB; an
+    # unsealed (full-rewrite) grow-save writes ~3,630 KB. This formula lands
+    # at ~702 KB -- about 4.5x above the sealed write and 5x below the full
+    # rewrite.
+    avg_msg_bytes = total_size / len(msgs)
+    cap = avg_msg_bytes * (M._SIDECAR_TAIL_KEEP + 1) * 5 + 32 * 1024
+    assert written["n"] < cap, (
+        f"a post-seal save wrote {written['n']:,} bytes (cap {cap:,.0f}) for a "
         f"{total_size:,}-byte history; sealing is not bounding the cost"
     )
     assert len(M.Session.load("cost").messages) == 12001, "and it is still lossless"
@@ -102,6 +117,18 @@ def test_a_segmented_save_is_read_free(session_store, monkeypatch):
     sail straight past it. Nothing else in the suite covers this either: the
     read-freeness tests in test_save_count_without_full_parse.py use sessions of
     five or six messages, which never segment at the default threshold.
+
+    Blind spot, named rather than closed: this spy patches exactly
+    `pathlib.Path.read_bytes` and `pathlib.Path.read_text` -- today's only two
+    read call-sites inside save() (traced in api/models.py's grow-save path).
+    A future regression that reads via `open(self.path).read()`, `os.read()`,
+    or `json.load(fp)` would bypass both patches and this assertion would pass
+    vacuously. Deliberately not widened to intercept `builtins.open`: this
+    same test also WRITES files (the seal + head + index), so a open()-level
+    read spy would have to thread write traffic through unfiltered and risks
+    counting or breaking its own writes -- a false positive, not a
+    correctness gain. If save() ever grows a new read call-site, this test
+    needs a matching new patch, not a broader one.
     """
     reads = {"n": 0}
     real = pathlib.Path.read_bytes
