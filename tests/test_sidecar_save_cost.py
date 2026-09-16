@@ -109,15 +109,49 @@ def test_save_cost_does_not_scale_with_history(session_store, monkeypatch):
 
 
 def test_repeated_saves_stay_bounded(session_store, monkeypatch):
+    """The same regression, sustained: 20 saves in a row must stay bounded.
+
+    The cap is DERIVED, for the reason spelled out in the test above. The fixed
+    40 MiB it used to be sat 8.6% under what 20 full rewrites of this fixture
+    cost (45.6 MB), so a PARTIAL regression -- anything that recovered even a
+    tenth of the sealing benefit -- fit under it and this test passed while the
+    cost it exists to bound had come back.
+    """
+    saves = 20
+    msgs = [{"role": "user", "timestamp": float(i), "content": "y" * 300} for i in range(6000)]
     s = M.Session(session_id="cost2", title="T", workspace=str(session_store.parent), model="glm",
-                  messages=[{"role": "user", "timestamp": float(i), "content": "y" * 300} for i in range(6000)])
+                  messages=list(msgs))
     s.save()
     written = _spy_bytes_written(monkeypatch, session_store)
-    for i in range(20):
+    for i in range(saves):
         s.messages = s.messages + [{"role": "user", "timestamp": 10000.0 + i, "content": "z"}]
         s.save()
-    assert written["n"] < 40 * 1024 * 1024, (
-        f"20 saves wrote {written['n']:,} bytes; that is a full rewrite per save"
+
+    # What ONE full rewrite of this history costs, in the serialisation save()
+    # actually writes (indent=2, ensure_ascii=False).
+    full_rewrite = len(json.dumps(msgs, ensure_ascii=False, indent=2).encode("utf-8"))
+    avg_msg_bytes = full_rewrite / len(msgs)
+    # A bounded save writes the tail: _SIDECAR_TAIL_KEEP messages, plus however
+    # many this loop has appended since the last seal (at most `saves`). Times
+    # the number of saves, times a small factor, plus per-save metadata slack.
+    # Tracks _SIDECAR_TAIL_KEEP and the fixture's own message size instead of
+    # being a round number chosen above one measurement.
+    # Measured on this fixture: the 20 sealed saves write 3,890,743 bytes; 20
+    # full rewrites cost 44,617,840. This formula lands at 10,322,559 -- 2.7x
+    # above the sealed regime and 4.3x below the unsealed one, where the old
+    # fixed 41,943,040 sat 6% under the unsealed cost.
+    per_save = avg_msg_bytes * (M._SIDECAR_TAIL_KEEP + saves)
+    cap = per_save * saves * 2.5 + saves * 32 * 1024
+    # Teeth first, as in the test above: if the cap ever stops sitting well
+    # below what the unsealed regime costs, fail HERE rather than pass on a
+    # full rewrite per save. Grow the fixture when this trips.
+    assert cap * 2 < saves * full_rewrite, (
+        f"cap {cap:,.0f} is not well below the {saves * full_rewrite:,} bytes {saves} full "
+        f"rewrites of this fixture cost; the test can no longer tell the two regimes apart"
+    )
+    assert written["n"] < cap, (
+        f"{saves} saves wrote {written['n']:,} bytes (cap {cap:,.0f}) for a "
+        f"{full_rewrite:,}-byte history; that is a full rewrite per save"
     )
     assert len(M.Session.load("cost2").messages) == 6020
 
