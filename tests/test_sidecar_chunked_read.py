@@ -174,6 +174,39 @@ def test_manifest_truncation_from_broken_continuity_is_reported(session_store):
     assert out["message_count"] == M._sealed_total([c1, c2, c3]) + 1, "the original claim stays visible"
 
 
+def test_a_memoryerror_parsing_a_chunk_is_not_reported_as_corruption(session_store):
+    """A transient allocation failure must propagate, not become a gap.
+
+    The chunk parse is the one place where "could not read it" and "it is
+    corrupt" are indistinguishable to the caller, and the difference decides
+    whether the session opens as its tail and the NEXT ordinary save persists
+    that truncation. This host runs with no swap and has been OOM-killed six
+    times in a week, so MemoryError is a real event.
+
+    Fails if the chunk-body guard in `_read_sidecar_document` is widened back
+    to `except Exception`: the MemoryError is then swallowed, the call returns
+    a document whose `messages` holds only the tail and whose `chunk_errors`
+    accuses the chunk of not being valid JSON.
+    """
+    c1 = _write_chunk(session_store, "s12", 1, _msgs(0, 2), 0)
+    p = _write_head(session_store, "s12", [c1], _msgs(2, 1))
+    # Match the chunk's exact bytes, not a substring: the HEAD's own manifest
+    # carries "seq"/"first_idx" too, so a key-based match would also fire on
+    # the head parse and prove nothing about the chunk path.
+    chunk_raw = (session_store / "s12.msgs" / "000001.json").read_bytes()
+    real_loads = json.loads
+
+    def fake_loads(s, *a, **k):
+        if s == chunk_raw:
+            raise MemoryError("simulated allocation failure")
+        return real_loads(s, *a, **k)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(M.json, "loads", fake_loads)
+        with pytest.raises(MemoryError):
+            M._read_sidecar_document(p, "s12")
+
+
 def test_session_load_reads_a_segmented_session(session_store):
     """The integration point: Session.load must return the full history."""
     c1 = _write_chunk(session_store, "s8", 1, _msgs(0, 4), 0)

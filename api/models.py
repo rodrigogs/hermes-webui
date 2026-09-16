@@ -1276,7 +1276,16 @@ def _read_sidecar_document(path, sid=None):
             continue
         try:
             body = json.loads(raw)
-        except Exception:
+        # Only the errors that mean "these bytes are not valid JSON"
+        # (json.JSONDecodeError is a ValueError). A MemoryError is an
+        # Exception too, and on this host -- 5.9 GiB, no swap -- a failed
+        # allocation while parsing a chunk is a real event, not a theoretical
+        # one. Recorded as corruption it would skip the chunk, open the
+        # session as its tail, and let the next ordinary save persist that
+        # truncation; raised, it is the transient failure it actually is. The
+        # neighbouring reads already draw the line here: the head parse
+        # returns None, the read_bytes above catches only OSError.
+        except (ValueError, UnicodeDecodeError):
             errors.append(f"{fname}: not valid JSON")
             continue
         msgs = body.get('messages') if isinstance(body, dict) else None
