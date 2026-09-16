@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -4579,6 +4580,28 @@ def _session_chunk_dir(sid):
     if not is_safe_session_id(sid):
         return None
     return SESSION_DIR / f'{sid}.msgs'
+
+
+def _remove_session_files(sid) -> None:
+    """Remove a session's head, its .bak and its sealed chunk directory.
+
+    One helper because four call sites in routes.py unlinked these by hand, and
+    each one that forgets the directory now leaks the BULK of the session --
+    with segmenting, the head is the small part.
+
+    Best-effort per item: a failure to remove one must not leave the others.
+    """
+    if not is_safe_session_id(sid):
+        return
+    head = SESSION_DIR / f'{sid}.json'
+    for p in (head, head.with_suffix('.json.bak')):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            logger.debug('could not remove %s', p, exc_info=True)
+    d = _session_chunk_dir(sid)
+    if d is not None:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _chunk_path(sid, seq):

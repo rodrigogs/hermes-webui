@@ -10441,6 +10441,7 @@ from api.models import (
     _profile_has_user_projects,
     is_cron_session,
     is_safe_session_id,
+    _remove_session_files,
     PROCESS_WAKEUP_PAUSE_ERROR,
     clear_process_wakeup_pause,
     clear_process_wakeup_pause_if_model_changed,
@@ -16092,20 +16093,15 @@ def handle_post(handler, parsed) -> bool:
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
-            sidecar_deleted = False
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session file %s", p)
+            # Removes the head, the .bak and the sealed chunk directory --
+            # the whole session is going away, so this is the one place a
+            # chunk dir may be reaped unconditionally (#segmented-sidecars).
+            _remove_session_files(sid)
             sidecar_deleted = not p.exists()
             try:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-            try:
-                p.with_suffix('.json.bak').unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
             if sidecar_deleted and not is_messaging_session:
                 try:
                     _record_webui_deleted_session_tombstone(sid)
@@ -22620,11 +22616,13 @@ def _handle_background(handler, body):
                 complete_background(parent_sid, task_id, _answer or "(no answer produced)")
             except Exception:
                 complete_background(parent_sid, task_id, "(background task failed)")
-            # Best-effort cleanup of the hidden bg session file so it doesn't
-            # clutter the sidebar or SESSION_DIR. The index is pruned on the
-            # next rebuild via _index_entry_exists().
+            # Best-effort cleanup of the hidden bg session -- head, .bak and
+            # sealed chunk dir -- so it doesn't clutter the sidebar or
+            # SESSION_DIR. The whole scratch session is discarded here, so
+            # reaping its chunk dir is safe. The index is pruned on the next
+            # rebuild via _index_entry_exists().
             try:
-                (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+                _remove_session_files(bg_sid)
             except Exception:
                 pass
         except Exception:
