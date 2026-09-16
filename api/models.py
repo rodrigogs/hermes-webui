@@ -2185,11 +2185,6 @@ class Session:
             'model': self.model,
             'model_provider': self.model_provider,
             'message_count': message_count,
-            # Only when non-empty (spec §3): the count above is the head's claim,
-            # and this is what the last read could not actually see behind it.
-            # Emitted here, next to the number it qualifies, so a session that
-            # opened as its tail cannot look healthy in the UI or the sidebar.
-            **({'chunk_errors': list(self.chunk_errors)} if self.chunk_errors else {}),
             'created_at': self.created_at,
             'updated_at': self.updated_at,
             'last_message_at': last_message_at,
@@ -2225,6 +2220,12 @@ class Session:
             # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
             **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
+            # Spec §3, and only when set: what the read behind `message_count`
+            # could NOT see, so a session that opened as its tail cannot look
+            # healthy in the UI or the sidebar. Emitted here rather than beside
+            # the count because test_465_session_branching scans a fixed window
+            # of this method's source for 'parent_session_id'.
+            **({'chunk_errors': list(self.chunk_errors)} if self.chunk_errors else {}),
             # #6672: immutable workspace captured at session creation, exposed so
             # the UI can distinguish it from the live `workspace` field (which
             # updates on mid-session switches without touching the system prompt).
