@@ -1233,6 +1233,15 @@ def _read_sidecar_document(path, sid=None):
         return None
     if not isinstance(doc, dict):
         return None
+    # A persisted `chunk_errors` describes the read that produced this head, not
+    # the disk THIS read is looking at: the chunks it accuses may have come back
+    # since (an NFS blip, a half-synced file, a restored backup). Drop it before
+    # anything below can inherit it -- everything this function returns under
+    # that key is recomputed from what this read actually managed to open, so a
+    # marker can clear itself. Carrying it forward instead would make it
+    # permanent and, via load(), keep denying the fast-path identity to a
+    # session whose chunks all read cleanly.
+    doc.pop('chunk_errors', None)
     raw_manifest = doc.get('message_chunks')
     manifest = _normalised_manifest(raw_manifest)
     # _normalised_manifest silently returns the longest safe prefix -- correct
@@ -1465,6 +1474,7 @@ class Session:
                  process_wakeup_pause=None,
                  share_token=None,
                  share_created_at=None,
+                 chunk_errors=None,
                  **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
@@ -1569,6 +1579,14 @@ class Session:
         self.process_wakeup_pause = process_wakeup_pause if isinstance(process_wakeup_pause, dict) else {}
         self.share_token = str(share_token).strip() if share_token else None
         self.share_created_at = share_created_at
+        # Spec §3's visible half of an incomplete read: the chunk problems the
+        # read that built THIS object hit, named so save() can persist them into
+        # the head's metadata and compact() can show them. Accepted as a real
+        # argument, not out of **kwargs, because that is precisely how the fact
+        # used to vanish -- `cls(**data)` absorbed `doc['chunk_errors']` and no
+        # production reader ever saw it again. Always derived from a load (which
+        # recomputes it from disk), never a value a head can pin permanently.
+        self.chunk_errors = list(chunk_errors or [])
         # #5854: a compact fingerprint of anchor_activity_scenes ({scene_key:
         # updated_at}) persisted BEFORE the messages array so the sidebar-poll
         # freshness check can compare scene freshness without parsing the full
@@ -1731,6 +1749,14 @@ class Session:
         if _manifest:
             meta['message_chunks'] = _manifest
         self._message_chunks = _manifest
+        # Spec §3: an incomplete read is persisted into the head, right after the
+        # manifest it contradicts and inside the cheap prefix, so the gap shows
+        # up in metadata instead of only in a log line. Only when non-empty: an
+        # empty list in every head would cost every prefix reader bytes and tell
+        # nobody anything. A later load recomputes this from disk, so a restored
+        # chunk clears it on the following save.
+        if self.chunk_errors:
+            meta['chunk_errors'] = list(self.chunk_errors)
         _head_messages = _tail
         meta['messages'] = _head_messages
         meta['tool_calls'] = self.tool_calls
@@ -1745,8 +1771,8 @@ class Session:
             meta[_k] = getattr(self, _k, None)
         # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
         # the keys we placed explicitly above so they aren't emitted twice.
-        _placed = {'message_count', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes',
-                   *_HEAVY_METADATA_TAIL_FIELDS}
+        _placed = {'message_count', 'anchor_scene_index', 'chunk_errors', 'messages', 'tool_calls',
+                   'anchor_activity_scenes', *_HEAVY_METADATA_TAIL_FIELDS}
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}
@@ -2154,6 +2180,11 @@ class Session:
             'model': self.model,
             'model_provider': self.model_provider,
             'message_count': message_count,
+            # Only when non-empty (spec §3): the count above is the head's claim,
+            # and this is what the last read could not actually see behind it.
+            # Emitted here, next to the number it qualifies, so a session that
+            # opened as its tail cannot look healthy in the UI or the sidebar.
+            **({'chunk_errors': list(self.chunk_errors)} if self.chunk_errors else {}),
             'created_at': self.created_at,
             'updated_at': self.updated_at,
             'last_message_at': last_message_at,
