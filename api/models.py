@@ -1771,8 +1771,13 @@ class Session:
             meta[_k] = getattr(self, _k, None)
         # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
         # the keys we placed explicitly above so they aren't emitted twice.
-        _placed = {'message_count', 'anchor_scene_index', 'chunk_errors', 'messages', 'tool_calls',
-                   'anchor_activity_scenes', *_HEAVY_METADATA_TAIL_FIELDS}
+        # `message_chunks` is in here even though nothing assigns a public
+        # attribute of that name today: `extra` is merged AFTER `meta`, so one
+        # ever appearing would silently overwrite the manifest this save just
+        # wrote -- and on an unsegmented head, where `meta` has no such key, it
+        # would serialize after `messages` and leave the cheap prefix.
+        _placed = {'message_count', 'anchor_scene_index', 'message_chunks', 'chunk_errors',
+                   'messages', 'tool_calls', 'anchor_activity_scenes', *_HEAVY_METADATA_TAIL_FIELDS}
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}

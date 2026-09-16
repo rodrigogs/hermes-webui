@@ -293,3 +293,33 @@ def test_truncating_below_the_sealed_count_does_not_silently_revert(session_stor
 
     reloaded = M.Session.load("w16")
     assert len(reloaded.messages) == 8, "the truncation must survive a reload, not be reverted by it"
+
+
+def test_a_public_message_chunks_attribute_cannot_displace_the_manifest(session_store):
+    """The manifest is save()'s to write; an attribute of the same name is not.
+
+    `extra` (everything on the object that save() did not place explicitly) is
+    merged AFTER `meta`, so a public `message_chunks` attribute wins the value.
+    Fails if `message_chunks` or `chunk_errors` leaves `_placed`: the head then
+    carries "junk" where the manifest should be -- and on an UNSEGMENTED
+    session, where `meta` never sets the key at all, it lands after `messages`,
+    outside the cheap prefix #5854 exists to keep small. Both failures are
+    silent: the head still parses, and only the next load discovers that the
+    sealed chunks are unreachable.
+    """
+    s = _sess(session_store, "w17", _msgs(0, 30))
+    s.save()
+    real = json.loads((session_store / "w17.json").read_bytes())["message_chunks"]
+    assert real, "the fixture must be segmented, or there is no manifest to displace"
+
+    s.message_chunks = "junk"           # a plausible future mistake: the public name
+    s.chunk_errors = ["not from a read"]
+    s.messages = s.messages + _msgs(100, 1)
+    s.save()
+
+    raw = (session_store / "w17.json").read_text(encoding="utf-8")
+    doc = json.loads(raw)
+    assert doc["message_chunks"] == real, "the real manifest must survive the attribute"
+    assert raw.count('"message_chunks"') == 1, "written once, by save(), not also by extra"
+    assert raw.index('"message_chunks"') < raw.index('"messages"'), "and still in the cheap prefix"
+    assert len(M.Session.load("w17").messages) == 31, "and the history is still reachable"
