@@ -36,7 +36,7 @@ import threading
 from contextlib import closing
 from pathlib import Path
 
-from api.models import _sealed_total
+from api.models import _normalised_manifest, _sealed_total
 from api.turn_journal import (
     derive_turn_journal_states,
     is_terminal_turn_event,
@@ -102,16 +102,30 @@ def _msg_count(p: Path) -> int:
     #
     # Deliberately NOT reading the chunk files: that would put the per-boot cost
     # this design removes straight back, and the counts are already here.
-    # `_sealed_total` is the one implementation of this sum (api/models.py); it
-    # returns 0 for a missing or malformed manifest, so an unsegmented head and a
-    # corrupt manifest both fall back to the tail. Erring low for a manifest that
-    # cannot be counted is the safe side here: it keeps the .bak eligible to win.
+    #
+    # `_normalised_manifest` FIRST, then `_sealed_total`, and the order is the
+    # whole correctness argument: this number must describe what a reader can
+    # actually reassemble, not what the file claims. `_normalised_manifest`
+    # truncates at a continuity break and `_read_sidecar_document` reads only
+    # that surviving prefix, so summing the RAW manifest counts messages no
+    # reader will ever return -- and a file that over-states itself SUPPRESSES
+    # ITS OWN RECOVERY. Measured on a 30-message head carrying one bogus
+    # `count: 900` entry at a broken `first_idx`:
+    #
+    #   _msg_count            : 930      <- pre-fix
+    #   Session.load reaches  : 30
+    #   inspect_...           : recommend 'no_action', with a 35-message .bak
+    #
+    # i.e. the damaged file beat its own good backup. Erring high is the
+    # dangerous direction here, because the only thing this number is ever
+    # compared against is a .bak. Both helpers together also make an unsegmented
+    # head and every malformed manifest shape fall back to the tail alone.
     #
     # The "torn file -> -1" contract above is untouched, and is why the manifest
     # is read from the head rather than from anywhere else: a head that will not
     # parse yields no manifest either, so a truncated live file still reads as -1
     # and its .bak can still win.
-    return len(msgs) + _sealed_total(data.get('message_chunks'))
+    return len(msgs) + _sealed_total(_normalised_manifest(data.get('message_chunks')))
 
 
 def _rebuild_recovery_session_index(session_dir: Path) -> None:

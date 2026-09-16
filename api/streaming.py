@@ -71,6 +71,7 @@ from api.models import (
     _normalised_manifest,
     _parse_nonnegative_int,
     _sealed_total,
+    _session_chunk_dir,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
     record_process_wakeup_provider_unavailable_pause,
@@ -4918,6 +4919,53 @@ def generate_session_title_for_session(session, *, prefer_latest: bool = False, 
     return None, llm_status or 'empty_title', raw_preview
 
 
+def _adoptable_manifest(sid, raw):
+    """The target head's manifest, but only if every chunk it names is present.
+
+    Adopting the target file's own manifest is what keeps an archive save
+    append-only instead of re-sealing the whole history, so it is preferred. It
+    is only sound while the manifest is backed by files, though: a head that
+    ALREADY names a missing chunk describes a hole, and adopting it carries that
+    hole forward into the head we are about to write. Clearing instead heals the
+    file outright, because the only caller that adopts does so on the branch that
+    fires when memory holds strictly MORE messages than the file claims -- memory
+    is a provable superset there, so re-sealing from it loses nothing.
+
+    Measured before this check, archiving 34 in-memory messages over a head whose
+    only chunk had been deleted: the head was written claiming 34 and still
+    naming ``000001.json``, and loading it returned 8 messages with
+    ``chunk_errors: ['000001.json: unreadable (FileNotFoundError)']`` -- 26
+    messages that were in memory at archive time made permanently unreachable
+    from the file that exists to be the last copy.
+
+    A manifest is read off disk, so ``file`` can be any string. A name that is
+    not a bare filename is refused rather than resolved, so a traversal is never
+    even stat()ed -- the same stance as ``_read_sidecar_document``.
+
+    The cost is one ``exists()`` per manifest entry, on the compression-rotation
+    path only (never per save), against a manifest that is ~167 entries for a
+    250,000-message session.
+    """
+    manifest = _normalised_manifest(raw)
+    if not manifest:
+        return []
+    chunk_dir = _session_chunk_dir(sid)
+    if chunk_dir is None:
+        return []
+    for entry in manifest:
+        fname = entry['file']
+        if Path(fname).name != fname:
+            logger.error('sidecar %s: refusing to adopt manifest naming %r', sid, fname)
+            return []
+        if not (chunk_dir / fname).exists():
+            logger.warning(
+                'sidecar %s: head names missing chunk %s; re-sealing from memory '
+                'instead of adopting a manifest with a hole', sid, fname,
+            )
+            return []
+    return manifest
+
+
 def _retarget_session_sidecar(s, sid, *, manifest=None) -> None:
     """Point a live Session object at a DIFFERENT sidecar file.
 
@@ -4944,7 +4992,9 @@ def _retarget_session_sidecar(s, sid, *, manifest=None) -> None:
     ``manifest`` is the manifest read out of the TARGET file's head, when the
     caller has just parsed it -- disk-derived authority for the file we are
     about to overwrite, which lets the following save stay append-only instead
-    of re-sealing the whole history. Omit it (or pass a malformed value) and the
+    of re-sealing the whole history. It is adopted only if it survives
+    ``_adoptable_manifest`` (well-formed, continuous, and every chunk it names
+    present on disk). Omit it, or pass anything that does not survive, and the
     manifest is cleared, which makes the next ``save()`` re-seal from memory
     under the new sid, allocating seqs from that sid's own chunk directory via
     ``_next_chunk_seq``. ``save()`` already handles an empty manifest: it seals
@@ -4954,7 +5004,7 @@ def _retarget_session_sidecar(s, sid, *, manifest=None) -> None:
     stay exactly where they are, still referenced by the old sid's own head.
     """
     s.session_id = sid
-    s._message_chunks = _normalised_manifest(manifest)
+    s._message_chunks = _adoptable_manifest(sid, manifest)
     s._disk_identity_seen = None
     s._disk_msg_count = None
 

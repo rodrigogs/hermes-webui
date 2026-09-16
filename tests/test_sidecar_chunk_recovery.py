@@ -70,16 +70,89 @@ def test_msg_count_keeps_the_minus_one_contract(session_store):
 def test_msg_count_ignores_a_malformed_manifest_rather_than_crashing(session_store):
     """A hand-edited or corrupt manifest must degrade to the tail, not raise.
 
-    Erring low here is the safe side for a manifest that cannot be counted: it
-    keeps a .bak eligible to win, and the .bak comparison is the only thing
-    _msg_count feeds.
+    Erring low is the safe side for a manifest that cannot be counted: it keeps a
+    .bak eligible to win, and the .bak comparison is the only thing _msg_count
+    feeds. The exact-equality assertions matter as much as the no-crash: an
+    earlier version of this test asserted only `>= tail`, which left the
+    DIRECTION unpinned and let the over-count below through review.
     """
     for bad in (None, "nope", 5, [], [{"count": "seven"}], [{"count": -3}], ["x"],
                 [{"count": 4}, "x"]):
         doc = {"session_id": "rb", "messages": _msgs(0, 3), "message_chunks": bad}
         p = session_store / "rb.json"
         p.write_text(json.dumps(doc), encoding="utf-8")
-        assert R._msg_count(p) >= 3, f"manifest {bad!r} must not lose the tail"
+        assert R._msg_count(p) == 3, f"manifest {bad!r} must count as tail-only"
+
+
+def _break_continuity_after_first_entry(path):
+    """Append a manifest entry whose `first_idx` does not chain, and lie big."""
+    head = json.loads(path.read_bytes())
+    head["message_chunks"] = head["message_chunks"] + [
+        {"seq": 2, "file": "000002.json", "count": 900, "first_idx": 999,
+         "sha256": "0" * 64, "first_key": None, "last_key": None}]
+    path.write_text(json.dumps(head), encoding="utf-8")
+    return head
+
+
+def test_msg_count_counts_only_the_manifest_prefix_load_can_reach(session_store):
+    """The count must match what `Session.load` can actually reassemble.
+
+    `_normalised_manifest` truncates a manifest at a continuity break, and
+    `_read_sidecar_document` reads only that surviving prefix. Summing the RAW
+    manifest counts past the break -- past entries whose messages no reader will
+    ever return -- and a file that over-states itself SUPPRESSES ITS OWN
+    RECOVERY. Measured before this fix, on a 30-message file carrying one bogus
+    `count: 900` entry at a broken `first_idx`:
+
+        _msg_count            : 930
+        Session.load reaches  : 30
+
+    Erring high here is the exact opposite of the err-low stance the rest of this
+    function takes, and it is the dangerous direction: the number only ever gets
+    compared against a .bak.
+    """
+    p = _segmented(session_store, "r9", n=30)
+    raw = _break_continuity_after_first_entry(p)["message_chunks"]
+
+    assert M._sealed_total(raw) == 926, "the raw manifest claims the bogus 900"
+    assert M._sealed_total(M._normalised_manifest(raw)) == 26, "only 26 chain"
+    assert R._msg_count(p) == 30, "prefix (26) + tail (4), not the raw 930"
+    assert len(M.Session.load("r9").messages) == 30, "and that is what load reaches"
+
+
+def test_a_manifest_break_at_position_zero_counts_the_tail_alone(session_store):
+    """A break in the FIRST entry leaves no reachable sealed prefix at all."""
+    p = _segmented(session_store, "r10", n=30)
+    head = json.loads(p.read_bytes())
+    head["message_chunks"] = [{**head["message_chunks"][0], "first_idx": 7}]
+    p.write_text(json.dumps(head), encoding="utf-8")
+
+    assert M._normalised_manifest(head["message_chunks"]) == []
+    assert R._msg_count(p) == 4, "nothing chains, so only the tail is reachable"
+    assert len(M.Session.load("r10").messages) == 4
+
+
+def test_an_over_stated_manifest_does_not_suppress_a_legitimate_restore(session_store):
+    """The consequence, end to end: the damaged file must not beat its own .bak.
+
+    Pre-fix this returned `recommend: no_action` with live_messages 930 against a
+    35-message backup -- the damaged file won, and the sweep left it in place.
+    """
+    p = _segmented(session_store, "r11", n=30)
+    _break_continuity_after_first_entry(p)
+    bak = {"session_id": "r11", "messages": _msgs(0, 35), "message_count": 35}
+    p.with_suffix(".json.bak").write_text(json.dumps(bak), encoding="utf-8")
+
+    status = R.inspect_session_recovery_status(p)
+
+    assert status["live_messages"] == 30, "the reachable total, not the claimed 930"
+    assert status["bak_messages"] == 35
+    assert status["recommend"] == "restore"
+
+    report = R.recover_all_sessions_on_startup(session_store)
+
+    assert report["restored"] == 1, f"the good .bak must win: {report['details']}"
+    assert len(json.loads(p.read_bytes())["messages"]) == 35
 
 
 def test_msg_count_does_not_read_chunk_files(session_store, monkeypatch):

@@ -171,6 +171,86 @@ def test_retarget_leaves_the_continuation_object_able_to_save_coherently(session
     _assert_reads_back("oldsid", 30)
 
 
+def test_archiving_heals_a_head_that_names_a_missing_chunk(session_store):
+    """Adopting the target's manifest must not perpetuate a dangling reference.
+
+    Adopting `old_sid`'s own manifest keeps the archive save append-only, which is
+    why it is preferred over clearing. But if that head ALREADY names a chunk that
+    is gone, adopting carries the hole forward, while clearing would have healed
+    the archive outright -- and at this point memory is provably a superset,
+    because the branch only fires when `len(s.messages) > existing_msgs`.
+
+    Measured before the fix, archiving 34 in-memory messages over an `oldsid`
+    head whose only chunk had been deleted:
+
+        after archive : message_count 34, chunks ['000001.json']
+        loads         : 8   chunk_errors ['000001.json: unreadable (FileNotFoundError)']
+
+    26 messages that were in memory at archive time became permanently
+    unreachable from the archive -- the very file that exists to be the last copy.
+    """
+    old = M.Session(session_id="oldsid", title="A", workspace=str(session_store.parent),
+                    model="glm", messages=_msgs(0, 30))
+    old.save()
+    (session_store / "oldsid.msgs" / "000001.json").unlink()
+    assert json.loads((session_store / "oldsid.json").read_bytes())["message_chunks"], \
+        "the head must still NAME the chunk it can no longer find"
+
+    # Memory is the superset the branch requires: 34 > the head's claimed 30.
+    s = M.Session(session_id="newsid", title="T", workspace=str(session_store.parent),
+                  model="glm", messages=_msgs(0, 34))
+
+    streaming._preserve_pre_compression_snapshot(s, "oldsid")
+
+    head = json.loads((session_store / "oldsid.json").read_bytes())
+    assert head["message_count"] == 34
+    for entry in head.get("message_chunks") or []:
+        assert (session_store / "oldsid.msgs" / entry["file"]).exists(), \
+            f"the archive still names a missing chunk: {entry['file']}"
+    _assert_reads_back("oldsid", 34)
+
+
+def test_a_present_manifest_is_still_adopted_rather_than_re_sealed(session_store):
+    """The guard against over-correcting: a healthy head keeps the cheap path.
+
+    If every named chunk is present the manifest is adopted, so the archive save
+    APPENDS. Re-sealing instead would be correct but would pay the full-history
+    write price this design exists to avoid, once per compression.
+    """
+    old = M.Session(session_id="oldsid", title="A", workspace=str(session_store.parent),
+                    model="glm", messages=_msgs(0, 30))
+    old.save()
+    sealed_before = json.loads((session_store / "oldsid.json").read_bytes())["message_chunks"]
+    assert [e["file"] for e in sealed_before] == ["000001.json"]
+    bytes_before = (session_store / "oldsid.msgs" / "000001.json").read_bytes()
+
+    s = M.Session(session_id="newsid", title="T", workspace=str(session_store.parent),
+                  model="glm", messages=_msgs(0, 40))
+
+    streaming._preserve_pre_compression_snapshot(s, "oldsid")
+
+    after = json.loads((session_store / "oldsid.json").read_bytes())["message_chunks"]
+    assert after[0] == sealed_before[0], "the existing sealed chunk was re-sealed, not kept"
+    assert [e["file"] for e in after] == ["000001.json", "000002.json"], \
+        "the archive save must APPEND, not restart the numbering"
+    assert (session_store / "oldsid.msgs" / "000001.json").read_bytes() == bytes_before, \
+        "an adopted chunk is write-once; its bytes must not be rewritten"
+    _assert_reads_back("oldsid", 40)
+
+
+def test_retarget_refuses_a_manifest_naming_a_traversal_path(session_store):
+    """A head is read off disk, so `file` can be anything. Refuse, do not stat it."""
+    s = M.Session(session_id="oldsid", title="T", workspace=str(session_store.parent),
+                  model="glm", messages=_msgs(0, 30))
+    s.save()
+    good = json.loads((session_store / "oldsid.json").read_bytes())["message_chunks"]
+
+    streaming._retarget_session_sidecar(
+        s, "oldsid", manifest=[{**good[0], "file": "../../etc/passwd"}])
+
+    assert s._message_chunks == [], "a traversal filename must never be adopted"
+
+
 def test_retarget_helper_drops_every_attribute_that_describes_the_old_file(session_store):
     """`_message_chunks`, `_disk_identity_seen` and `_disk_msg_count` all describe
     ONE file. A retarget must leave none of them behind."""
