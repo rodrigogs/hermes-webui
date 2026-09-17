@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import api.models as M
@@ -417,4 +418,133 @@ def fsck_sessions(session_dir=None, *, verify=False) -> dict:
         for f in sorted(d.glob('*.json')):
             if f.name not in referenced:
                 report['orphans'].append({'session_id': sid, 'file': str(f), 'bytes': f.stat().st_size})
+    return report
+
+
+def _live_manifest_files_from_prefix(head) -> set | None:
+    """Chunk filenames the live head names, read from the CHEAP PREFIX only.
+
+    `message_chunks` sits before `messages` in every head this code writes, so
+    `_read_metadata_json_prefix` (1 MiB budget) yields it without touching the
+    array. None when the prefix cannot be read -- the caller must then treat
+    the session as unknown, never as "references nothing".
+    """
+    try:
+        prefix = M._read_metadata_json_prefix(head)
+        if prefix is None:
+            return None
+        doc = json.loads(prefix)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    return {e['file'] for e in M._normalised_manifest(doc.get('message_chunks'))}
+
+
+def gc_sessions(session_dir=None, *, apply=False, min_age_s=900, webui_stopped=False,
+                include_unmanifested=False) -> dict:
+    """Reclaim chunk files that no head names. Operator-invoked, webui STOPPED.
+
+    A candidate is a `NNNNNN.json` in `<sid>.msgs/` that neither the live head
+    nor its `.bak` names, whose own mtime AND the head's mtime are older than
+    `min_age_s`. Everything else is reported, never touched: directories whose
+    head is archived (`<sid>.json.*` sibling) or gone, directories whose live
+    manifest is empty while files remain (the post-unchunk / materialize shape
+    -- those can be the only copy of messages no head names; pass
+    `include_unmanifested=True` to treat them as candidates), sessions whose
+    head or `.bak` cannot be read.
+
+    `apply=False` (default) reports `would_reclaim`. `apply=True` requires
+    `webui_stopped=True` -- the operator's assertion that no cached Session
+    can publish a manifest while this runs; it is not verifiable from here,
+    it exists so a script cannot omit the precondition by accident. Before the
+    first unlink for a sid the `.seq_hwm` mark is raised to the highest seq in
+    the directory (a released number is never reissued); before EACH unlink
+    the live head's manifest is re-read and a file it now names is skipped.
+    Never removes a head, a `.bak`, `.seq_hwm`, or any non-conforming name.
+
+    `_write_seq_hwm` is read-then-write, not locked: two `apply=True` runs
+    racing each other could clobber a higher mark with a lower one. That is
+    acceptable here because gc is a webui-stopped operator tool meant to be
+    run one at a time, never concurrently with itself; this does not add
+    locking.
+    """
+    session_dir = Path(session_dir or M.SESSION_DIR)
+    if apply and not webui_stopped:
+        raise ValueError('gc_sessions(apply=True) requires webui_stopped=True: stop the webui '
+                         '(docker compose stop webui) so no cached Session can publish while chunks are removed')
+    if apply and session_dir != Path(M.SESSION_DIR):
+        raise ValueError('gc_sessions(apply=True) only operates on the active SESSION_DIR')
+    now = time.time()
+    report = {'sessions': [], 'would_reclaim': 0, 'reclaimed': 0, 'bytes_reclaimed': 0,
+              'archived_chunk_dirs': [], 'headless_chunk_dirs': [], 'unmanifested_chunk_dirs': [],
+              'manifest_unreadable': [], 'skipped_busy': []}
+    for d in sorted(session_dir.glob('*.msgs')):
+        if not d.is_dir():
+            continue
+        sid = d.name[:-len('.msgs')]
+        if not M.is_safe_session_id(sid):
+            report['manifest_unreadable'].append(sid)
+            continue
+        head = session_dir / f'{sid}.json'
+        if not head.exists():
+            files, nbytes = _chunk_dir_footprint(d)
+            row = {'session_id': sid, 'files': files, 'bytes': nbytes}
+            (report['archived_chunk_dirs'] if any(session_dir.glob(f'{sid}.json.*'))
+             else report['headless_chunk_dirs']).append(row)
+            continue
+        live = _live_manifest_files_from_prefix(head)
+        if live is None:
+            report['manifest_unreadable'].append(sid)
+            continue
+        bak_referenced, bak_err = _bak_manifest_files(head)
+        if bak_err:
+            report['manifest_unreadable'].append(f'{sid} (.bak: {bak_err})')
+            continue
+        try:
+            conforming = [f for f in d.iterdir() if M._CHUNK_FILENAME_RE.match(f.name)]
+            head_age = now - head.stat().st_mtime
+        except OSError:
+            report['manifest_unreadable'].append(sid)
+            continue
+        if not live and conforming and not include_unmanifested:
+            report['unmanifested_chunk_dirs'].append({'session_id': sid, 'files': len(conforming)})
+            continue
+        if head_age < min_age_s:
+            report['skipped_busy'].append(sid)
+            continue
+        referenced = live | bak_referenced
+        candidates = []
+        for f in sorted(conforming):
+            if f.name in referenced:
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if now - st.st_mtime < min_age_s:
+                continue
+            candidates.append((f, st.st_size))
+        row = {'session_id': sid, 'candidates': [f.name for f, _ in candidates],
+               'bytes': sum(s for _, s in candidates), 'reclaimed': []}
+        report['would_reclaim'] += len(candidates)
+        if apply and candidates:
+            highest = max(int(M._CHUNK_FILENAME_RE.match(f.name).group(1)) for f in conforming)
+            if not M._write_seq_hwm(sid, highest):
+                row['error'] = 'could not write .seq_hwm; nothing removed'
+                report['sessions'].append(row)
+                continue
+            for f, size in candidates:
+                live_now = _live_manifest_files_from_prefix(head)
+                if live_now is None or f.name in live_now:
+                    continue
+                try:
+                    f.unlink()
+                except OSError:
+                    logger.debug('gc %s: could not remove %s', sid, f.name, exc_info=True)
+                    continue
+                row['reclaimed'].append(f.name)
+                report['reclaimed'] += 1
+                report['bytes_reclaimed'] += size
+        report['sessions'].append(row)
     return report
