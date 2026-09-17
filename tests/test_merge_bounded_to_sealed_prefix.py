@@ -69,12 +69,23 @@ def _turn(history, i):
 
 
 def test_default_is_byte_for_byte_todays_behaviour():
-    """Fails if the default sealed_prefix_len stops being 0 or the prefix split changes output."""
+    """Fails if the default sealed_prefix_len is non-zero, or if anything on the
+    default (sealed_prefix_len=0) path changes: the marker filter, the dedupe, or
+    the _sealed_prefix + _deduped re-concatenation. Asserts full-array equality
+    against today's output, not just the marker-dropped/delta-appended shape, and
+    cross-checks the default call against an explicit sealed_prefix_len=0 call on
+    a fresh copy of the same inputs.
+    """
     hist = _history(300, marker_at=40)
     ctx, result, text = _turn(hist, 300)
     out = _merge_display_messages_after_agent_result(list(hist), ctx, result, text)
-    assert not any(m["content"].startswith("[CONTEXT COMPACTION") for m in out), "today drops the marker"
-    assert out[-2:] == result[-2:]
+    expected = [m for m in hist if not m["content"].startswith("[CONTEXT COMPACTION")] + result[-2:]
+    assert out == expected
+
+    hist2 = _history(300, marker_at=40)
+    ctx2, result2, text2 = _turn(hist2, 300)
+    out_explicit = _merge_display_messages_after_agent_result(list(hist2), ctx2, result2, text2, sealed_prefix_len=0)
+    assert out == out_explicit
 
 
 def test_marker_below_the_boundary_survives_and_the_delta_is_identical():

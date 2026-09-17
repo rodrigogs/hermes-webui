@@ -4889,12 +4889,14 @@ def _manifest_matches_memory(manifest, messages) -> bool:
     Two paths edit messages in place. `_try_retry_journal_recovery_in_place`
     (api/models.py) walks back from the end and stops at the first ordinary
     assistant message, so it stays in the tail; but it can attach `reasoning`
-    to a message INSIDE a sealed chunk, which a v1 key cannot see -- v2 keys
-    (_structural_key_v2) exist for that. `_merge_display_messages_after_agent_result`
-    (api/streaming.py) used to filter the WHOLE array every turn and was the
-    cause of every production re-seal on 2026-09-17; since C1 its filters run
-    over the unsealed suffix only, and only its backfill (rare, logged) can
-    still reach sealed history.
+    to a message INSIDE a sealed chunk, and the boundary key here --
+    `(role, timestamp, len(content))` -- cannot see that: none of those three
+    fields change when `reasoning` is merely attached to a message. Detecting
+    it would need a key that looks at content, not just the boundary.
+    `_merge_display_messages_after_agent_result` (api/streaming.py) used to
+    filter the WHOLE array every turn and was the cause of every production
+    re-seal on 2026-09-17; since C1 its filters run over the unsealed suffix
+    only, and only its backfill (rare, logged) can still reach sealed history.
     """
     if not manifest:
         return True
