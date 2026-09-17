@@ -4785,6 +4785,51 @@ def _normalised_manifest(raw):
 
 _CHUNK_FILENAME_RE = re.compile(r'^(\d{6})\.json$')
 
+_SEQ_HWM_NAME = '.seq_hwm'
+
+
+def _read_seq_hwm(sid) -> int:
+    """The highest chunk seq ever RELEASED for `sid` (0 when none recorded).
+
+    Lives in `<sid>.msgs/.seq_hwm`. Absent or unparsable reads as 0 -- a bad
+    marker must degrade to today's disk-max behaviour, never block sealing.
+    """
+    d = _session_chunk_dir(sid)
+    if d is None:
+        return 0
+    try:
+        return max(0, int((d / _SEQ_HWM_NAME).read_text(encoding='utf-8').strip() or 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_seq_hwm(sid, value) -> bool:
+    """Raise the high-water mark to `value`; never lower it. tmp + fsync + replace.
+
+    Every deleter of chunk files calls this BEFORE its first unlink, so a
+    number that is about to be freed can never be reissued: with disk-derived
+    allocation alone, gc would free 000002, the next seal would reuse it, and
+    a stale manifest (a cached Session, a .bak, an operator's copy) would then
+    name a file that EXISTS with different messages -- an existence check
+    passes, load() drops it on sha256, and the loss survives a .bak restore.
+    """
+    d = _session_chunk_dir(sid)
+    if d is None:
+        return False
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        value = max(int(value), _read_seq_hwm(sid))
+        tmp = d / f'{_SEQ_HWM_NAME}.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(str(value))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / _SEQ_HWM_NAME)
+        return True
+    except (OSError, ValueError):
+        logger.error('sidecar %s: could not write %s', sid, _SEQ_HWM_NAME, exc_info=True)
+        return False
+
 
 def _next_chunk_seq(sid):
     """The next unused chunk seq for `sid`, derived from DISK, not memory.
@@ -4803,7 +4848,8 @@ def _next_chunk_seq(sid):
     its number) -- harmless, since the manifest chains on `first_idx`, never
     on `seq` contiguity. Names that do not parse as exactly six digits plus
     `.json` are ignored, not treated as an error: a stray file must not block
-    sealing.
+    sealing. Also never below the .seq_hwm mark (see _write_seq_hwm): a
+    number a deleter released is never reissued.
     """
     d = _session_chunk_dir(sid)
     if d is None:
@@ -4817,7 +4863,7 @@ def _next_chunk_seq(sid):
         m = _CHUNK_FILENAME_RE.match(name)
         if m:
             best = max(best, int(m.group(1)))
-    return best + 1
+    return max(best, _read_seq_hwm(sid)) + 1
 
 
 def _seal_chunk(sid, seq, msgs, first_idx):

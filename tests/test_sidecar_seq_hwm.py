@@ -1,0 +1,95 @@
+"""C2c: a chunk number, once used, is never handed out again (spec 2026-09-17 §3.6).
+
+All three refuters of the design found the same hole by different routes: a
+deleter frees a number, _next_chunk_seq (disk max + 1) reissues it, and a stale
+manifest -- in a cached object, a .bak, an operator's copy -- names a file that
+exists with different messages.
+"""
+import json
+from collections import OrderedDict
+from pathlib import Path
+
+import pytest
+
+import api.models as M
+from api import sidecar_maintenance as SM
+
+
+@pytest.fixture
+def session_store(tmp_path, monkeypatch):
+    sdir = tmp_path / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(M, "SESSION_DIR", sdir)
+    monkeypatch.setattr(M, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(M, "_SIDECAR_TAIL_MAX_MSGS", 10)
+    monkeypatch.setattr(M, "_SIDECAR_TAIL_KEEP", 5)
+    return sdir
+
+
+def _msg(i, role="user", content=None):
+    return {"role": role, "timestamp": float(i), "content": content if content is not None else f"{role} message {i}"}
+
+
+def _segmented(session_store, sid, n=30):
+    """A session sealed once: with TAIL_MAX=10/KEEP=5, n=30 seals 25 into one chunk, 5 stay in the tail."""
+    s = M.Session(session_id=sid, title="T", workspace=str(session_store.parent), model="glm",
+                  messages=[_msg(i) for i in range(n)])
+    s.save(touch_updated_at=False, skip_index=True)
+    return s
+
+
+def _chunks(session_store, sid):
+    d = session_store / f"{sid}.msgs"
+    return sorted(p.name for p in d.glob("*.json")) if d.exists() else []
+
+
+def _manifest(session_store, sid):
+    return M._normalised_manifest(json.loads((session_store / f"{sid}.json").read_bytes()).get("message_chunks"))
+
+
+def test_next_seq_honours_the_high_water_mark(session_store):
+    """Fails if _next_chunk_seq ignores .seq_hwm (returns disk max + 1 = 2 here)."""
+    _segmented(session_store, "h1", n=30)
+    assert _chunks(session_store, "h1") == ["000001.json"]
+    assert M._write_seq_hwm("h1", 7) is True
+    assert M._read_seq_hwm("h1") == 7
+    assert M._next_chunk_seq("h1") == 8
+
+
+def test_hwm_never_lowers(session_store):
+    """Fails if _write_seq_hwm overwrites with a smaller value."""
+    _segmented(session_store, "h2", n=30)
+    M._write_seq_hwm("h2", 9)
+    M._write_seq_hwm("h2", 3)
+    assert M._read_seq_hwm("h2") == 9
+
+
+def test_corrupt_or_absent_hwm_reads_as_zero(session_store):
+    """Fails if a bad .seq_hwm blocks sealing instead of degrading to today's behaviour."""
+    _segmented(session_store, "h3", n=30)
+    assert M._read_seq_hwm("h3") == 0
+    (session_store / "h3.msgs" / ".seq_hwm").write_text("not a number", encoding="utf-8")
+    assert M._read_seq_hwm("h3") == 0
+    assert M._next_chunk_seq("h3") == 2
+
+
+def test_a_freed_number_is_not_reissued_after_a_deleter_raised_the_mark(session_store):
+    """THE scenario. Fails if the next seal after a deletion reuses the deleted number."""
+    s = _segmented(session_store, "h4", n=30)
+    # a deleter (gc/unchunk, Tasks 6-7) writes the mark first, then unlinks
+    M._write_seq_hwm("h4", 1)
+    (session_store / "h4.msgs" / "000001.json").unlink()
+    s.messages = s.messages + [_msg(30 + i) for i in range(12)]   # forces a re-seal (chunk 1 is gone) + seal
+    s.save(touch_updated_at=False, skip_index=True)
+    names = _chunks(session_store, "h4")
+    assert names and "000001.json" not in names, f"000001 must never come back: {names}"
+    assert min(int(n[:6]) for n in names) >= 2
+
+
+def test_fsck_reports_the_mark_under_other_files_never_orphans(session_store):
+    """Fails if fsck lists .seq_hwm as an orphan or crashes on it."""
+    _segmented(session_store, "h5", n=30)
+    M._write_seq_hwm("h5", 1)
+    rep = SM.fsck_sessions(session_store)
+    assert rep["orphans"] == []
+    assert rep["other_files"] == [{"session_id": "h5", "count": 1}]

@@ -315,7 +315,7 @@ def fsck_sessions(session_dir=None, *, verify=False) -> dict:
     """
     session_dir = session_dir or M.SESSION_DIR
     report = {'sessions': [], 'orphans': [], 'headless_chunk_dirs': [],
-              'archived_chunk_dirs': [], 'errors': []}
+              'archived_chunk_dirs': [], 'errors': [], 'other_files': []}
     referenced_by_sid: dict[str, set] = {}
     for head in sorted(session_dir.glob('*.json')):
         if head.name.startswith('_'):
@@ -408,6 +408,12 @@ def fsck_sessions(session_dir=None, *, verify=False) -> dict:
                 report['headless_chunk_dirs'].append(row)
             continue
         referenced = referenced_by_sid.get(sid, set())
+        try:
+            other = sum(1 for f in d.iterdir() if not M._CHUNK_FILENAME_RE.match(f.name))
+        except OSError:
+            other = 0
+        if other:
+            report['other_files'].append({'session_id': sid, 'count': other})
         for f in sorted(d.glob('*.json')):
             if f.name not in referenced:
                 report['orphans'].append({'session_id': sid, 'file': str(f), 'bytes': f.stat().st_size})
