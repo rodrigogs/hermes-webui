@@ -141,9 +141,13 @@ def unchunk_session(sid) -> dict:
                           sid, bak_err)
         else:
             # Spec 2026-09-17 §3.6: raise the mark BEFORE the first unlink so no
-            # number released here is ever reissued to a different chunk.
+            # number released here is ever reissued to a different chunk. The
+            # `.bak`'s own seqs count too: a number it names that is ALREADY gone
+            # from disk is still reissuable by disk-max alone, and handing it to
+            # different bytes is precisely what makes that `.bak` unrestorable.
             highest = max([e['seq'] for e in manifest] +
-                          [int(m.group(1)) for m in (M._CHUNK_FILENAME_RE.match(p.name) for p in d.iterdir()) if m])
+                          [int(m.group(1)) for m in (M._CHUNK_FILENAME_RE.match(p.name) for p in d.iterdir()) if m] +
+                          [int(n[:6]) for n in bak_referenced if M._CHUNK_FILENAME_RE.match(n)])
             if not M._write_seq_hwm(sid, highest):
                 logger.error('unchunk %s: could not write .seq_hwm; leaving every chunk in place', sid)
                 return out
@@ -484,7 +488,8 @@ def gc_sessions(session_dir=None, *, apply=False, min_age_s=900, webui_stopped=F
     can publish a manifest while this runs; it is not verifiable from here,
     it exists so a script cannot omit the precondition by accident. Before the
     first unlink for a sid the `.seq_hwm` mark is raised to the highest seq in
-    the directory (a released number is never reissued); before EACH unlink
+    the directory OR named by the `.bak` (a released number is never reissued,
+    including one the `.bak` names that is already gone); before EACH unlink
     the live head's manifest is re-read and a file it now names is skipped.
     Never removes a head, a `.bak`, `.seq_hwm`, or any non-conforming name.
 
@@ -561,7 +566,11 @@ def gc_sessions(session_dir=None, *, apply=False, min_age_s=900, webui_stopped=F
                'bytes': sum(s for _, s in candidates), 'reclaimed': []}
         report['would_reclaim'] += len(candidates)
         if apply and candidates:
-            highest = max(int(M._CHUNK_FILENAME_RE.match(f.name).group(1)) for f in conforming)
+            # The `.bak`'s own seqs count too: a number it names that is ALREADY
+            # gone from disk is still reissuable by disk-max alone, and handing it
+            # to different bytes is what makes that `.bak` unrestorable.
+            highest = max([int(M._CHUNK_FILENAME_RE.match(f.name).group(1)) for f in conforming] +
+                          [int(n[:6]) for n in bak_referenced if M._CHUNK_FILENAME_RE.match(n)])
             if not M._write_seq_hwm(sid, highest):
                 row['error'] = 'could not write .seq_hwm; nothing removed'
                 report['sessions'].append(row)

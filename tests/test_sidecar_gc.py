@@ -247,6 +247,22 @@ def test_a_bak_that_will_not_parse_is_reported_unreadable_and_untouched(session_
     assert sorted(_chunks(session_store, "gj")) == sorted([live, "000002.json", "000003.json"])
 
 
+def test_a_bak_only_number_that_is_already_gone_is_never_reissued(session_store):
+    """Fails if gc raises `.seq_hwm` only to the highest seq still ON DISK: a
+    number the `.bak` names but that is already deleted stays reissuable, the
+    next seal hands it to different bytes, and the `.bak` becomes unrestorable
+    in exactly the way the mark exists to prevent (ledger L107)."""
+    _, live = _orphaned(session_store, "gm")
+    bak = json.loads((session_store / "gm.json").read_bytes())
+    bak["message_chunks"] = [dict(bak["message_chunks"][0], file="000009.json", seq=9)]
+    (session_store / "gm.json.bak").write_text(json.dumps(bak), encoding="utf-8")
+    assert not (session_store / "gm.msgs" / "000009.json").exists()
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True)
+    assert rep["reclaimed"] == 2
+    assert M._read_seq_hwm("gm") >= 9, "a bak-only, already-deleted number must raise the mark too"
+    assert M._next_chunk_seq("gm") >= 10
+
+
 def test_include_unmanifested_reclaims_an_unreferenced_chunk_dir(session_store):
     """Fails if `include_unmanifested=True` does not actually enable reclaiming
     a directory whose head no longer carries a message_chunks manifest --

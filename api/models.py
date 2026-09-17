@@ -1667,6 +1667,11 @@ class Session:
             kept_n = _sealed_total(keep)
             logger.info('sidecar %s: sealed chunks diverge from memory after entry %d of %d (message %d); re-sealing from there',
                         self.session_id, len(keep), len(manifest), kept_n)
+            dropped = [e.get('seq') for e in manifest[len(keep):] if isinstance(e.get('seq'), int)]
+            if dropped:
+                # Every observation of a released number raises the mark (spec §3.6) --
+                # the publish sweep already does this; this is the common discovery point.
+                _write_seq_hwm(self.session_id, max(dropped))
             manifest = list(keep)
             if _SIDECAR_TAIL_MAX_MSGS > 0 and len(all_msgs) - kept_n > _SIDECAR_TAIL_KEEP:
                 manifest = manifest + _seal_span(self.session_id, all_msgs[kept_n:-_SIDECAR_TAIL_KEEP], kept_n)
@@ -1926,15 +1931,12 @@ class Session:
                     tmp.unlink(missing_ok=True)
                     logger.warning('sidecar %s: %d chunk file(s) named by the head vanished before publish (%s); re-sealing (attempt %d)',
                                    self.session_id, len(_missing), ', '.join(map(str, _missing[:3])), _attempt + 1)
-                    # _write_seq_hwm's contract ("every deleter calls this BEFORE
-                    # its first unlink") assumes the deleter releases the number;
-                    # here WE learn of the release only after the fact, from a
-                    # disk scan that can no longer see the vacated file. Without
-                    # this, _next_chunk_seq (disk-max only) reissues the SAME seq
-                    # for genuinely different bytes -- the exact stale-manifest
-                    # collision _write_seq_hwm exists to prevent, self-inflicted
-                    # by our own re-seal. Bump past exactly the vacated seqs (not
-                    # the whole manifest) before re-deriving the layout.
+                    # Every observation of a released number raises the mark (spec
+                    # §3.6) -- _sealed_layout does this at the top-of-save
+                    # discovery point, this is the same rule at publish time.
+                    # Bump past exactly the vacated seqs (not the whole manifest)
+                    # before re-deriving the layout, or _next_chunk_seq (disk-max
+                    # only) reissues the SAME seq for genuinely different bytes.
                     _vacated = [e.get('seq') for e in (_manifest or [])
                                 if e.get('file') in _missing and isinstance(e.get('seq'), int)]
                     if _vacated:

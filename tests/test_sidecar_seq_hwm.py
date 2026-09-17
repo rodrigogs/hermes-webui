@@ -86,6 +86,43 @@ def test_a_freed_number_is_not_reissued_after_a_deleter_raised_the_mark(session_
     assert min(int(n[:6]) for n in names) >= 2
 
 
+def test_a_chunk_vanished_before_save_never_has_its_number_reissued(session_store):
+    """The reviewer's probe. Fails if `_sealed_layout` stops raising the mark for
+    the manifest entries it drops: the released number is reissued to genuinely
+    different bytes, and a stale cached Session then publishes a manifest naming
+    a file whose sha256 no longer matches (55 of 61 messages lost, no .bak --
+    the array grew, so the #1558 shrink guard did not fire -- and
+    `recover_session` only stats existence, so it would not refuse either)."""
+    s = _segmented(session_store, "vz", n=30)
+    assert _chunks(session_store, "vz") == ["000001.json"]
+    sha_before = _manifest(session_store, "vz")[0]["sha256"]
+
+    # A SECOND live object for the same sid: a cached Session in a running webui.
+    M.SESSIONS.clear()
+    stale = M.Session.load("vz")
+    assert [e["file"] for e in stale._message_chunks] == ["000001.json"]
+
+    # An operator `rm`: the file goes, nothing raises the mark.
+    (session_store / "vz.msgs" / "000001.json").unlink()
+
+    # The first object saves: the TOP-of-save path discovers the gap and re-seals.
+    s.messages = s.messages + [_msg(30)]
+    s.save(touch_updated_at=False, skip_index=True)
+    assert M._read_seq_hwm("vz") >= 1, "the discovery point must record the released number"
+    man = _manifest(session_store, "vz")
+    assert man and man[0]["file"] > "000001.json", f"000001 must never be reissued: {man!r:.120}"
+    assert man[0]["sha256"] != sha_before, "the re-seal covers more messages, so different bytes"
+
+    # The stale object saves an ORDINARY tail-only grow: it republishes its own
+    # 000001.json entry verbatim if (and only if) that name came back.
+    stale.messages = stale.messages + [_msg(31)]
+    stale.save(touch_updated_at=False, skip_index=True)
+    M.SESSIONS.clear()
+    loaded = M.Session.load("vz")
+    assert loaded.chunk_errors == [], f"the stale republish poisoned the head: {loaded.chunk_errors}"
+    assert len(loaded.messages) == len(stale.messages)
+
+
 def test_fsck_reports_the_mark_under_other_files_never_orphans(session_store):
     """Fails if fsck lists .seq_hwm as an orphan or crashes on it."""
     _segmented(session_store, "h5", n=30)
