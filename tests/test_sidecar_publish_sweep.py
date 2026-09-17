@@ -80,6 +80,54 @@ def test_three_failures_raise_and_leave_the_previous_head(session_store, monkeyp
     assert not list(session_store.glob("p3.tmp*"))
 
 
+def test_the_third_publish_attempt_does_not_reseal_into_the_void(session_store, monkeypatch):
+    """Fails if save() re-derives the layout on the LAST publish attempt: the loop
+    is about to raise, so those chunks are sealed for a head nobody will ever
+    write -- pure orphans, one full re-seal of the prefix each, on the very
+    session that is already OOM-pressured. Two re-derivations, not three."""
+
+    def seal_spy():
+        real, seen = M._seal_chunk, []
+        monkeypatch.setattr(M, "_seal_chunk", lambda *a, **k: seen.append(a[1]) or real(*a, **k))
+        return seen
+
+    def deleting_sweep(sid, manifest):
+        """A deleter that always wins the race: it really unlinks what the head names."""
+        d = session_store / f"{sid}.msgs"
+        gone = []
+        for e in manifest or []:
+            (d / e["file"]).unlink(missing_ok=True)
+            gone.append(e["file"])
+        return gone
+
+    # (a) one forced re-derivation, measured -- the unit the assertion is in.
+    a = _segmented(session_store, "f4a", n=30)
+    state = {"n": 0}
+    real_missing = M._missing_manifest_files
+
+    def sweep_once(sid, manifest):
+        state["n"] += 1
+        return deleting_sweep(sid, manifest) if state["n"] == 1 else real_missing(sid, manifest)
+
+    monkeypatch.setattr(M, "_missing_manifest_files", sweep_once)
+    seals_a = seal_spy()
+    a.messages = a.messages + [_msg(30)]
+    a.save(touch_updated_at=False, skip_index=True)
+    per_rederivation = len(seals_a)
+    assert per_rederivation >= 1, "the probe must actually force a re-seal"
+
+    # (b) every attempt misses -> the loop exhausts and raises.
+    b = _segmented(session_store, "f4b", n=30)
+    monkeypatch.setattr(M, "_missing_manifest_files", deleting_sweep)
+    seals_b = seal_spy()
+    b.messages = b.messages + [_msg(30)]
+    with pytest.raises(RuntimeError):
+        b.save(touch_updated_at=False, skip_index=True)
+    assert len(seals_b) == 2 * per_rederivation, \
+        f"three attempts must re-derive TWICE, not three times: {seals_b}"
+    assert not list(session_store.glob("f4b.tmp*"))
+
+
 def test_load_rereads_when_chunk_errors_and_the_head_changed(session_store, monkeypatch):
     """Fails if load() believes chunk_errors without noticing the head moved under it."""
     s = _segmented(session_store, "lr", n=30)

@@ -1925,30 +1925,41 @@ class Session:
                 # seconds later, and a deleter (unchunk, gc) can have removed a
                 # chunk in between. A head that names a file which is not on
                 # disk is never published: re-derive the layout (which re-seals
-                # from the gap) and try again, at most three times.
+                # from the gap) and try again -- three attempts, so at most TWO
+                # re-derivations; the third failure raises instead of re-sealing.
                 _missing = _missing_manifest_files(self.session_id, _manifest)
                 if _missing:
                     tmp.unlink(missing_ok=True)
                     logger.warning('sidecar %s: %d chunk file(s) named by the head vanished before publish (%s); re-sealing (attempt %d)',
                                    self.session_id, len(_missing), ', '.join(map(str, _missing[:3])), _attempt + 1)
-                    # Every observation of a released number raises the mark (spec
-                    # §3.6) -- _sealed_layout does this at the top-of-save
-                    # discovery point, this is the same rule at publish time.
-                    # Bump past exactly the vacated seqs (not the whole manifest)
-                    # before re-deriving the layout, or _next_chunk_seq (disk-max
-                    # only) reissues the SAME seq for genuinely different bytes.
-                    _vacated = [e.get('seq') for e in (_manifest or [])
-                                if e.get('file') in _missing and isinstance(e.get('seq'), int)]
-                    if _vacated:
-                        _write_seq_hwm(self.session_id, max(_vacated))
-                    _manifest, _tail = self._sealed_layout(_all)
-                    self._message_chunks = _manifest
-                    if _manifest:
-                        meta['message_chunks'] = _manifest
-                    else:
-                        meta.pop('message_chunks', None)
-                    meta['messages'] = _tail
-                    payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+                    # Only re-derive when another attempt FOLLOWS. On the last one
+                    # the loop is about to raise, so a re-seal here writes chunks
+                    # no head will ever name -- pure orphans, a full re-seal of
+                    # the prefix each, on the very session already under memory
+                    # pressure. Nothing to gain, everything to leave behind.
+                    if _attempt < 2:
+                        # Every observation of a released number raises the mark
+                        # (spec §3.6) -- _sealed_layout does this at the
+                        # top-of-save discovery point, this is the same rule at
+                        # publish time. Bump past exactly the vacated seqs (not
+                        # the whole manifest) before re-deriving the layout, or
+                        # _next_chunk_seq (disk-max only) reissues the SAME seq
+                        # for genuinely different bytes.
+                        _vacated = [e.get('seq') for e in (_manifest or [])
+                                    if e.get('file') in _missing and isinstance(e.get('seq'), int)]
+                        if _vacated:
+                            _write_seq_hwm(self.session_id, max(_vacated))
+                        _manifest, _tail = self._sealed_layout(_all)
+                        self._message_chunks = _manifest
+                        if _manifest:
+                            meta['message_chunks'] = _manifest
+                        else:
+                            meta.pop('message_chunks', None)
+                        meta['messages'] = _tail
+                        payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+                    # `continue` either way: the tmp is gone and this attempt
+                    # published nothing, so the loop must NOT fall through to the
+                    # rename. On the third pass it exhausts into the `raise` below.
                     continue
                 # Identity of what WE wrote, stamped on tmp BEFORE the rename: rename
                 # keeps inode, size and mtime, so this equals stat(self.path) after
