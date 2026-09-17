@@ -1908,26 +1908,63 @@ class Session:
         except OSError:
             pass
 
-        tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
-        try:
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            # Identity of what WE wrote, stamped on tmp BEFORE the rename: rename
-            # keeps inode, size and mtime, so this equals stat(self.path) after
-            # it unless someone else has written since. Stamping after the rename
-            # would leave a window in which their write reads as ours.
-            _written_identity = _disk_identity(tmp)
-            _safe_replace(tmp, self.path)
-            self._disk_identity_seen = _written_identity
-            self._disk_msg_count = len(self.messages or [])
-        except Exception:
+        for _attempt in range(3):
+            tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
             try:
-                tmp.unlink(missing_ok=True)
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                # Spec 2026-09-17 §3.5: the manifest was checked against disk at
+                # the top of save(), but the head is published here, up to
+                # seconds later, and a deleter (unchunk, gc) can have removed a
+                # chunk in between. A head that names a file which is not on
+                # disk is never published: re-derive the layout (which re-seals
+                # from the gap) and try again, at most three times.
+                _missing = _missing_manifest_files(self.session_id, _manifest)
+                if _missing:
+                    tmp.unlink(missing_ok=True)
+                    logger.warning('sidecar %s: %d chunk file(s) named by the head vanished before publish (%s); re-sealing (attempt %d)',
+                                   self.session_id, len(_missing), ', '.join(map(str, _missing[:3])), _attempt + 1)
+                    # _write_seq_hwm's contract ("every deleter calls this BEFORE
+                    # its first unlink") assumes the deleter releases the number;
+                    # here WE learn of the release only after the fact, from a
+                    # disk scan that can no longer see the vacated file. Without
+                    # this, _next_chunk_seq (disk-max only) reissues the SAME seq
+                    # for genuinely different bytes -- the exact stale-manifest
+                    # collision _write_seq_hwm exists to prevent, self-inflicted
+                    # by our own re-seal. Bump past exactly the vacated seqs (not
+                    # the whole manifest) before re-deriving the layout.
+                    _vacated = [e.get('seq') for e in (_manifest or [])
+                                if e.get('file') in _missing and isinstance(e.get('seq'), int)]
+                    if _vacated:
+                        _write_seq_hwm(self.session_id, max(_vacated))
+                    _manifest, _tail = self._sealed_layout(_all)
+                    self._message_chunks = _manifest
+                    if _manifest:
+                        meta['message_chunks'] = _manifest
+                    else:
+                        meta.pop('message_chunks', None)
+                    meta['messages'] = _tail
+                    payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+                    continue
+                # Identity of what WE wrote, stamped on tmp BEFORE the rename: rename
+                # keeps inode, size and mtime, so this equals stat(self.path) after
+                # it unless someone else has written since. Stamping after the rename
+                # would leave a window in which their write reads as ours.
+                _written_identity = _disk_identity(tmp)
+                _safe_replace(tmp, self.path)
+                self._disk_identity_seen = _written_identity
+                self._disk_msg_count = len(self.messages or [])
+                break
             except Exception:
-                pass
-            raise
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        else:
+            raise RuntimeError(f'sidecar {self.session_id}: could not publish a head whose chunks all exist after 3 attempts')
         if not skip_index:
             _write_session_index(updates=[self])
 
@@ -1974,6 +2011,21 @@ class Session:
         # TextIOWrapper decode into an intermediate str measured 1.9x on a 112 MB
         # sidecar (862 -> 453 ms, best of 3, warm). Same objects, same errors.
         data = _read_sidecar_document(p, sid)
+        # Spec 2026-09-17 §3.8: a gap reported while the head changed under the
+        # read is more likely a race with a re-seal or a reclaim than damage.
+        # A chunk can only be reclaimed after the head stopped naming it, so a
+        # stable identity across the read proves the errors are real; a changed
+        # one means the retry reads the new head. Bounded, then today's path.
+        for _retry in range(3):
+            if data is None or not data.get('chunk_errors'):
+                break
+            _now = _disk_identity(p)
+            if _now == _pre_read_identity:
+                break
+            logger.info('sidecar %s: chunk_errors while the head changed; re-reading (%d/3)', sid, _retry + 1)
+            _pre_read_sig = _sidecar_stat_signature(p)
+            _pre_read_identity = _now
+            data = _read_sidecar_document(p, sid)
         if data is None:
             return None
         # The ON-DISK length, taken before the collapse below shortens the object.
@@ -5037,6 +5089,21 @@ def _reusable_manifest_prefix(sid, manifest, messages):
             break
         keep.append(entry)
     return keep
+
+
+def _missing_manifest_files(sid, manifest):
+    """Names in `manifest` whose chunk file is not on disk right now (os.stat only)."""
+    d = _session_chunk_dir(sid)
+    if d is None:
+        return [e.get('file') for e in manifest or []]
+    missing = []
+    for e in manifest or []:
+        fname = e.get('file')
+        try:
+            os.stat(d / fname)
+        except (OSError, TypeError):
+            missing.append(fname)
+    return missing
 
 
 def _manifest_matches_memory(manifest, messages) -> bool:
