@@ -242,3 +242,33 @@ def test_startup_sweep_restores_over_a_torn_segmented_live_file(session_store):
 
     assert report["restored"] == 1
     assert len(json.loads(p.read_bytes())["messages"]) == 6
+
+
+def test_recover_session_refuses_a_bak_whose_chunk_is_missing(session_store):
+    """Fails if recover_session installs a .bak head that names a vanished chunk (a silent tail-only restore)."""
+    s = M.Session(session_id="rb", title="T", workspace=str(session_store.parent), model="glm",
+                  messages=[{"role": "user", "timestamp": float(i), "content": f"m{i}"} for i in range(30)])
+    s.save(touch_updated_at=False, skip_index=True)                       # segmented: 26 sealed + 4
+    head = session_store / "rb.json"
+    (session_store / "rb.json.bak").write_bytes(head.read_bytes())          # .bak == segmented head
+    s.messages = s.messages[:3]                                             # shrink -> live has fewer
+    s.save(touch_updated_at=False, skip_index=True)
+    (session_store / "rb.msgs" / "000001.json").unlink()                    # the .bak's chunk is gone
+    before = head.read_bytes()
+    res = R.recover_session(head)
+    assert res["restored"] is False and res.get("error") == "bak_chunks_missing"
+    assert "000001.json" in res["missing"] and head.read_bytes() == before
+
+
+def test_recover_session_restores_when_the_baks_chunks_exist(session_store):
+    """Fails if the new check refuses a healthy .bak."""
+    s = M.Session(session_id="rg", title="T", workspace=str(session_store.parent), model="glm",
+                  messages=[{"role": "user", "timestamp": float(i), "content": f"m{i}"} for i in range(30)])
+    s.save(touch_updated_at=False, skip_index=True)
+    (session_store / "rg.json.bak").write_bytes((session_store / "rg.json").read_bytes())
+    s.messages = s.messages[:3]
+    s.save(touch_updated_at=False, skip_index=True)
+    res = R.recover_session(session_store / "rg.json")
+    assert res["restored"] is True
+    M.SESSIONS.clear()
+    assert len(M.Session.load("rg").messages) == 30

@@ -451,6 +451,23 @@ def recover_session(session_path: Path) -> dict:
     if status["recommend"] != "restore":
         return {**status, "restored": False}
     bak_path = session_path.with_suffix('.json.bak')
+    # Spec 2026-09-17 §4.3: a .bak is a head; restoring it installs its
+    # manifest. If any chunk it names is gone, the restored session would
+    # come up as its tail -- the silent truncation save() refuses to publish.
+    # Refuse here for the same reason; nothing on disk is touched.
+    try:
+        from api.models import _read_metadata_json_prefix, _normalised_manifest, _session_chunk_dir
+        prefix = _read_metadata_json_prefix(bak_path)
+        bak_doc = json.loads(prefix) if prefix else json.loads(bak_path.read_bytes())
+        chunk_dir = _session_chunk_dir(session_path.stem)
+        missing = [e['file'] for e in _normalised_manifest(bak_doc.get('message_chunks') if isinstance(bak_doc, dict) else None)
+                   if chunk_dir is None or not (chunk_dir / e['file']).exists()]
+    except (OSError, ValueError):
+        missing = []
+    if missing:
+        logger.warning("recover_session: NOT restoring %s -- its .bak names %d missing chunk(s): %s",
+                       session_path.name, len(missing), ', '.join(missing[:5]))
+        return {**status, "restored": False, "error": "bak_chunks_missing", "missing": missing}
     # Stage the recovery via a tmp copy + atomic replace so a crash mid-restore
     # cannot leave a half-written session.json.
     tmp_path = session_path.with_suffix('.json.recover.tmp')

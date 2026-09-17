@@ -3,6 +3,7 @@ import json
 import pathlib
 import shutil
 from collections import OrderedDict
+from pathlib import Path
 
 import pytest
 
@@ -44,14 +45,40 @@ def _two_chunk(session_store, sid):
     return session_store / f"{sid}.json"
 
 
+def _assert_no_chunk_files_remain(chunk_dir):
+    """After an unchunk, no sealed `NNNNNN.json` may remain in `chunk_dir`.
+
+    The directory itself may still exist: `unchunk_session` raises `.seq_hwm`
+    before its first unlink (spec 2026-09-17 SS3.6) and never deletes that mark,
+    so once it has been written the directory can no longer become fully
+    empty -- `d.rmdir()` fails harmlessly on it. Deleting the mark along with
+    the directory would let a later re-segmentation of the same session
+    allocate a released number again (see
+    test_a_reseal_after_unchunk_never_reuses_a_released_number). So this
+    checks the property that actually matters -- no chunk file survives --
+    not whether the directory itself is gone.
+    """
+    if not chunk_dir.exists():
+        return
+    names = {f.name for f in chunk_dir.iterdir()}
+    assert not any(M._CHUNK_FILENAME_RE.match(n) for n in names), names
+    assert names <= {".seq_hwm"}, names
+
+
 def test_unchunk_folds_everything_back_into_one_file(session_store):
+    """Folds a segmented session back into one file.
+
+    The chunk directory may survive holding only `.seq_hwm` -- see
+    `_assert_no_chunk_files_remain` -- so this checks that no chunk FILE
+    remains, not that the directory itself vanished.
+    """
     p = _segmented(session_store, "m1", n=22)
     out = unchunk_session("m1")
     assert out["unchunked"] is True and out["messages"] == 22
     doc = json.loads(p.read_bytes())
     assert not doc.get("message_chunks")
     assert [m["content"] for m in doc["messages"]] == [f"m{i}" for i in range(22)]
-    assert not (session_store / "m1.msgs").exists()
+    _assert_no_chunk_files_remain(session_store / "m1.msgs")
     assert [m["content"] for m in M.Session.load("m1").messages] == [f"m{i}" for i in range(22)]
 
 
@@ -273,6 +300,10 @@ def test_unchunk_all_folds_every_segmented_session_and_skips_an_archived_one(ses
     -- or if a session whose head is missing gets folded anyway: there is
     nothing to fold into, and an archived session must be neither resurrected
     nor stripped of the chunks that hold its history.
+
+    Per-session, this checks that no chunk FILE survives the fold, not that
+    the `.msgs` directory itself is gone -- it may still hold `.seq_hwm`; see
+    `_assert_no_chunk_files_remain`.
     """
     for sid in ("n1", "n2", "n3"):
         _segmented(session_store, sid, n=22)
@@ -288,7 +319,7 @@ def test_unchunk_all_folds_every_segmented_session_and_skips_an_archived_one(ses
         doc = json.loads((session_store / f"{sid}.json").read_bytes())
         assert not doc.get("message_chunks")
         assert [m["content"] for m in doc["messages"]] == [f"m{i}" for i in range(22)]
-        assert not (session_store / f"{sid}.msgs").exists()
+        _assert_no_chunk_files_remain(session_store / f"{sid}.msgs")
     assert [r["session_id"] for r in out["skipped"]] == ["n4"]
     assert "head" in out["skipped"][0]["reason"], out["skipped"]
     assert sorted(p.name for p in (session_store / "n4.msgs").glob("*.json")) == archived_chunks
@@ -311,3 +342,54 @@ def test_unchunk_all_keeps_going_after_a_session_it_cannot_fold(session_store):
     assert [r["session_id"] for r in out["skipped"]] == ["n5"]
     assert not json.loads((session_store / "n6.json").read_bytes()).get("message_chunks")
     assert (session_store / "n5.msgs").exists(), "a refusal must leave the chunks alone"
+
+
+def test_unchunk_raises_the_seq_mark_before_its_first_unlink(session_store, monkeypatch):
+    """Fails if unchunk_session removes a chunk without first recording its number in .seq_hwm
+    (a later seal could reuse the freed number under a stale manifest)."""
+    import os
+    _two_chunk(session_store, "u1")
+    order = []
+    real_write, real_unlink = M._write_seq_hwm, Path.unlink
+    monkeypatch.setattr(M, "_write_seq_hwm", lambda sid, v: order.append(("hwm", v)) or real_write(sid, v))
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: order.append(("unlink", self.name)) or real_unlink(self, *a, **k))
+    res = unchunk_session("u1")
+    assert res["unchunked"] and res["removed_chunks"] == 2
+    unlinks = [i for i, o in enumerate(order) if o[0] == "unlink" and o[1].endswith(".json") and not o[1].startswith("u1.tmp")]
+    hwms = [i for i, o in enumerate(order) if o[0] == "hwm"]
+    assert hwms and unlinks and hwms[0] < unlinks[0], order
+    assert M._read_seq_hwm("u1") == 2 and M._next_chunk_seq("u1") == 3
+
+
+def test_unchunk_rereads_the_head_before_each_unlink(session_store, monkeypatch):
+    """Fails if unchunk removes a chunk the (rewritten) live head has started naming again."""
+    from api import sidecar_maintenance as SM
+    _two_chunk(session_store, "u2")
+    real = SM._live_manifest_files_from_prefix
+    monkeypatch.setattr(SM, "_live_manifest_files_from_prefix", lambda head: real(head) | {"000002.json"})
+    res = unchunk_session("u2")
+    assert res["unchunked"] and res["removed_chunks"] == 1
+    assert (session_store / "u2.msgs" / "000002.json").exists()
+
+
+def test_a_reseal_after_unchunk_never_reuses_a_released_number(session_store):
+    """Fails if the .seq_hwm mark is deleted along with the (emptied) chunk
+    directory, or if `_next_chunk_seq` stops honouring it: either way a later
+    re-segmentation of the same session would allocate 000001 again, and a
+    still-present `.bak` (or a cached Session) naming the OLD 000001.json
+    would then silently match a file holding completely different messages.
+    """
+    _two_chunk(session_store, "ur")
+    out = unchunk_session("ur")
+    assert out["unchunked"] and out["removed_chunks"] == 2
+    assert M._read_seq_hwm("ur") == 2
+
+    s = M.Session.load("ur")
+    s.messages = s.messages + [{"role": "user", "ts": float(100 + i), "content": f"g{i}"} for i in range(50)]
+    s.save()
+
+    doc = json.loads((session_store / "ur.json").read_bytes())
+    new_files = [e["file"] for e in doc["message_chunks"]]
+    assert new_files, "the growth must have forced at least one new sealed chunk"
+    assert all(f > "000002.json" for f in new_files), new_files
+    assert M._read_seq_hwm("ur") >= 2

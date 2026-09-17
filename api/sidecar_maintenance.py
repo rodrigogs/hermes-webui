@@ -83,6 +83,15 @@ def unchunk_session(sid) -> dict:
     none. Any file left behind this way simply keeps the directory (and
     itself) on disk; that is not a failure of unchunking, which has already
     succeeded once the head is rewritten to hold everything.
+
+    The chunk directory is deliberately left behind holding `.seq_hwm` even
+    when every chunk file was removed: deleting the mark along with the
+    directory would let a later re-segmentation of this same session reuse a
+    released chunk number (spec 2026-09-17 §3.6).
+
+    Run with the webui STOPPED: a cached Session in a live webui can republish
+    the old manifest after this rewrote the head (same message count, so the
+    cache-freshness check does not notice); spec 2026-09-17 §4.2.
     """
     out = {'session_id': sid, 'unchunked': False, 'messages': 0, 'removed_chunks': 0}
     if not M.is_safe_session_id(sid):
@@ -131,6 +140,13 @@ def unchunk_session(sid) -> dict:
             logger.error('unchunk %s: not removing any chunk file -- %s; its needs could not be ruled out',
                           sid, bak_err)
         else:
+            # Spec 2026-09-17 §3.6: raise the mark BEFORE the first unlink so no
+            # number released here is ever reissued to a different chunk.
+            highest = max([e['seq'] for e in manifest] +
+                          [int(m.group(1)) for m in (M._CHUNK_FILENAME_RE.match(p.name) for p in d.iterdir()) if m])
+            if not M._write_seq_hwm(sid, highest):
+                logger.error('unchunk %s: could not write .seq_hwm; leaving every chunk in place', sid)
+                return out
             removed = 0
             for entry in manifest:
                 fname = entry.get('file')
@@ -141,6 +157,13 @@ def unchunk_session(sid) -> dict:
                     # tail-only shrink does not force a re-seal, so the live
                     # head and the .bak can share a sealed chunk. Removing it
                     # would make that .bak unrestorable. Leave it.
+                    continue
+                # §4.2: the head was rewritten above, but a cached Session in a
+                # LIVE webui can republish a manifest at any moment (this tool
+                # is documented webui-stopped for that reason); re-read the live
+                # manifest right before each unlink and skip a file it names.
+                live_now = _live_manifest_files_from_prefix(head)
+                if live_now is None or fname in live_now:
                     continue
                 try:
                     (d / fname).unlink()
@@ -153,9 +176,11 @@ def unchunk_session(sid) -> dict:
             except OSError:
                 # Not empty -- a chunk the .bak still needs, an orphan the
                 # manifest never named (a crash residue or a re-seal
-                # residue), or some other best-effort failure. Either way the
-                # fold already succeeded and must not be reported as failed
-                # because of this.
+                # residue), the just-written `.seq_hwm` mark (expected: it is
+                # never deleted, so the directory stays non-empty for good
+                # once it exists), or some other best-effort failure. Either
+                # way the fold already succeeded and must not be reported as
+                # failed because of this.
                 logger.debug('unchunk %s: chunk dir not removed (not empty?)', sid, exc_info=True)
     return out
 
