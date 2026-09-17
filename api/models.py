@@ -1166,6 +1166,17 @@ _SIDECAR_TAIL_MAX_BYTES = int(os.getenv('HERMES_WEBUI_SIDECAR_TAIL_MAX_BYTES', '
 _SIDECAR_TAIL_KEEP = 500
 
 
+#: Sealed chunk size caps (spec 2026-09-17 §3.1). A re-seal keeps every chunk
+#: that still matches and rewrites from the first divergent one, so the cost
+#: of an edit is bounded by what follows it; capping chunks bounds how much
+#: one chunk can make "what follows it" cost. NOT derived from
+#: _SIDECAR_TAIL_MAX_MSGS: the suite monkeypatches that to 10, and a derived
+#: cap would shatter every fixture's prefix. 4 MiB keeps the 203 MB session
+#: at ~50 manifest entries in the cheap prefix.
+_SIDECAR_CHUNK_MAX_BYTES = int(os.getenv('HERMES_WEBUI_SIDECAR_CHUNK_MAX_BYTES', '4194304') or 0)
+_SIDECAR_CHUNK_MAX_MSGS = int(os.getenv('HERMES_WEBUI_SIDECAR_CHUNK_MAX', '20000') or 0)
+
+
 def _read_metadata_json_prefix(path, max_prefix_bytes=_METADATA_PREFIX_MAX_BYTES):
     """Read only the metadata portion before the large arrays.
 
@@ -1631,6 +1642,48 @@ class Session:
     def path(self):
         return SESSION_DIR / f'{self.session_id}.json'
 
+    def _sealed_layout(self, all_msgs):
+        """(manifest, tail) for `all_msgs`: what stays sealed, what the head carries.
+
+        Keeps every chunk that still describes the array and is on disk
+        (_reusable_manifest_prefix); re-seals from the first that does not;
+        then seals the tail if it crossed the thresholds. The tail is ALWAYS
+        derived from the manifest -- never sliced by a constant -- so with a
+        partially landed span nothing between the last sealed message and the
+        last TAIL_KEEP can be lost: _sealed_total(manifest) + len(tail) ==
+        len(all_msgs) on every path. Called at the top of save() and again at
+        publish time if a chunk vanished in between (spec 2026-09-17 §3.5).
+        """
+        manifest = _normalised_manifest(getattr(self, '_message_chunks', None))
+        keep = _reusable_manifest_prefix(self.session_id, manifest, all_msgs)
+        if len(keep) < len(manifest):
+            # History was rewritten in place (collapse #2592, clear #5532, shrink
+            # #6911, truncation, edit-and-resend, a reasoning edit by journal
+            # recovery) -- or a chunk file is gone. Keep what still holds and
+            # re-seal only from the first entry that does not. Before
+            # 2026-09-17 the whole manifest was discarded and the entire prefix
+            # rewritten as ONE chunk: two 5 MB full re-seals in one minute on
+            # one production session, both files orphaned.
+            kept_n = _sealed_total(keep)
+            logger.info('sidecar %s: sealed chunks diverge from memory after entry %d of %d (message %d); re-sealing from there',
+                        self.session_id, len(keep), len(manifest), kept_n)
+            manifest = list(keep)
+            if _SIDECAR_TAIL_MAX_MSGS > 0 and len(all_msgs) - kept_n > _SIDECAR_TAIL_KEEP:
+                manifest = manifest + _seal_span(self.session_id, all_msgs[kept_n:-_SIDECAR_TAIL_KEEP], kept_n)
+        tail = all_msgs[_sealed_total(manifest):]
+        if _SIDECAR_TAIL_MAX_MSGS > 0 and len(tail) > _SIDECAR_TAIL_KEEP:
+            over_count = len(tail) > _SIDECAR_TAIL_MAX_MSGS
+            over_bytes = False
+            if not over_count and _SIDECAR_TAIL_MAX_BYTES > 0:
+                try:
+                    over_bytes = len(json.dumps(tail, ensure_ascii=False).encode('utf-8')) > _SIDECAR_TAIL_MAX_BYTES
+                except (TypeError, ValueError):
+                    over_bytes = False
+            if over_count or over_bytes:
+                manifest = manifest + _seal_span(self.session_id, tail[:-_SIDECAR_TAIL_KEEP], _sealed_total(manifest))
+                tail = all_msgs[_sealed_total(manifest):]
+        return manifest, tail
+
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
@@ -1706,46 +1759,8 @@ class Session:
         # whole crash argument: the worst a crash can leave is an orphan chunk,
         # which load() ignores. The reverse order could leave a manifest naming
         # a file that does not exist.
-        _manifest = _normalised_manifest(getattr(self, '_message_chunks', None))
-        if not _manifest_matches_memory(_manifest, self.messages):
-            # History was rewritten in place (collapse #2592, clear #5532,
-            # intentional shrink #6911, truncation, edit-and-resend). The sealed
-            # chunks describe a prefix this object no longer has, so re-seal from
-            # memory with fresh seq numbers. Correctness over cost: the one-off
-            # price is today's every-save price, and the old files stay on disk
-            # as orphans rather than being deleted.
-            # Seq comes from DISK, never from the manifest we are discarding: a
-            # never-loaded object has an empty manifest, and max(..., default=0)+1
-            # then picks seq 1 and OVERWRITES an existing chunk. That was proven
-            # in Task 3 to destroy the .bak's referent (restoring it returned 4 of
-            # 30 claimed messages) and was fixed there by _next_chunk_seq.
-            logger.info('sidecar %s: sealed chunks no longer match memory, re-sealing', self.session_id)
-            _reseal_from = _next_chunk_seq(self.session_id)
-            _manifest = []
-            _all = self.messages or []
-            if _SIDECAR_TAIL_MAX_MSGS > 0 and len(_all) > _SIDECAR_TAIL_KEEP:
-                _entry = _seal_chunk(self.session_id, _reseal_from,
-                                     _all[:-_SIDECAR_TAIL_KEEP], 0)
-                if _entry is not None:
-                    _manifest = [_entry]
-        _all_msgs = self.messages or []
-        _sealed_n = _sealed_total(_manifest)
-        _tail = _all_msgs[_sealed_n:]
-        if _SIDECAR_TAIL_MAX_MSGS > 0 and len(_tail) > _SIDECAR_TAIL_KEEP:
-            _over_count = len(_tail) > _SIDECAR_TAIL_MAX_MSGS
-            _over_bytes = False
-            if not _over_count and _SIDECAR_TAIL_MAX_BYTES > 0:
-                try:
-                    _over_bytes = len(json.dumps(_tail, ensure_ascii=False).encode('utf-8')) > _SIDECAR_TAIL_MAX_BYTES
-                except (TypeError, ValueError):
-                    _over_bytes = False
-            if _over_count or _over_bytes:
-                _to_seal = _tail[:-_SIDECAR_TAIL_KEEP]
-                _next_seq = _next_chunk_seq(self.session_id)
-                _entry = _seal_chunk(self.session_id, _next_seq, _to_seal, _sealed_n)
-                if _entry is not None:
-                    _manifest = _manifest + [_entry]
-                    _tail = _tail[-_SIDECAR_TAIL_KEEP:]
+        _all = self.messages or []
+        _manifest, _tail = self._sealed_layout(_all)
         if _manifest:
             meta['message_chunks'] = _manifest
         self._message_chunks = _manifest
@@ -4892,6 +4907,39 @@ def _seal_chunk(sid, seq, msgs, first_idx):
             'first_idx': int(first_idx), 'sha256': _sha256_hex(raw), 'key_v': 2,
             'first_key': list(_structural_key_v2(msgs[0])) if msgs else None,
             'last_key': list(_structural_key_v2(msgs[-1])) if msgs else None}
+
+
+def _seal_span(sid, msgs, first_idx):
+    """Seal `msgs` (starting at index `first_idx`) into one or more chunks.
+
+    Slices by BOTH caps -- at most _SIDECAR_CHUNK_MAX_MSGS messages and at most
+    _SIDECAR_CHUNK_MAX_BYTES serialised bytes per chunk, one message minimum so
+    an oversized message still seals alone. Each chunk takes a fresh
+    _next_chunk_seq. Returns the manifest entries that actually landed, in
+    order, stopping at the first _seal_chunk that returns None (a race loser,
+    an unwritable directory): the caller derives its tail from _sealed_total
+    of what comes back, so a partial span is lossless.
+    """
+    entries = []
+    i, n = 0, len(msgs)
+    while i < n:
+        j, size = i, 0
+        while j < n:
+            if j > i and _SIDECAR_CHUNK_MAX_MSGS > 0 and (j - i) >= _SIDECAR_CHUNK_MAX_MSGS:
+                break
+            try:
+                size += len(json.dumps(msgs[j], ensure_ascii=False).encode('utf-8')) + 1
+            except (TypeError, ValueError):
+                size += 1
+            if j > i and _SIDECAR_CHUNK_MAX_BYTES > 0 and size > _SIDECAR_CHUNK_MAX_BYTES:
+                break
+            j += 1
+        entry = _seal_chunk(sid, _next_chunk_seq(sid), msgs[i:j], first_idx + i)
+        if entry is None:
+            break
+        entries.append(entry)
+        i = j
+    return entries
 
 
 def _matching_manifest_prefix(manifest, messages):

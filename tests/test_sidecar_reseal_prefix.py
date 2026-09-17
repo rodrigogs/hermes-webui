@@ -110,3 +110,66 @@ def test_manifest_matches_memory_contract_unchanged():
           "first_key": list(M._structural_key(_msg(0))), "last_key": list(M._structural_key(_msg(1)))}
     assert M._manifest_matches_memory([ok], [_msg(0)]) is False
     assert M._manifest_matches_memory([ok], [_msg(0), _msg(1)]) is True
+
+
+def test_reseal_after_a_mid_history_edit_keeps_earlier_chunks(session_store):
+    """Fails if save() discards the whole manifest on divergence (chunks 1-2 would be re-sealed)."""
+    s = _five_chunks(session_store, "rs")
+    man = _manifest(session_store, "rs")
+    before = set(_chunks(session_store, "rs"))
+    cut = man[2]["first_idx"] + 3
+    s.messages = s.messages[:cut] + s.messages[cut + 2:]
+    s.save(touch_updated_at=False, skip_index=True)
+    after = _manifest(session_store, "rs")
+    assert [e["file"] for e in after[:2]] == [man[0]["file"], man[1]["file"]], "chunks 1-2 kept verbatim"
+    assert all(e["file"] not in before for e in after[2:]), "everything from chunk 3 on is new"
+    assert M._sealed_total(after) + len(json.loads((session_store / "rs.json").read_bytes())["messages"]) == len(s.messages)
+    M.SESSIONS.clear()
+    assert [m["timestamp"] for m in M.Session.load("rs").messages] == [m["timestamp"] for m in s.messages]
+
+
+def test_seal_span_respects_both_caps(session_store, monkeypatch):
+    """Fails if _seal_span ignores _SIDECAR_CHUNK_MAX_BYTES or _SIDECAR_CHUNK_MAX_MSGS."""
+    monkeypatch.setattr(M, "_SIDECAR_CHUNK_MAX_BYTES", 2000)
+    monkeypatch.setattr(M, "_SIDECAR_CHUNK_MAX_MSGS", 7)
+    msgs = [_msg(i, content="x" * 100) for i in range(40)]          # ~150 B each: bytes cap → ~13/chunk, msgs cap → 7
+    entries = M._seal_span("sp", msgs, 0)
+    assert entries and all(e["count"] <= 7 for e in entries)
+    assert sum(e["count"] for e in entries) == 40
+    assert [e["first_idx"] for e in entries] == [sum(x["count"] for x in entries[:i]) for i in range(len(entries))]
+    monkeypatch.setattr(M, "_SIDECAR_CHUNK_MAX_MSGS", 1000)
+    big = [_msg(i, content="y" * 5000) for i in range(3)]             # each message alone exceeds 2000 B
+    entries = M._seal_span("sp2", big, 0)
+    assert [e["count"] for e in entries] == [1, 1, 1], "an oversized message seals alone, never dropped"
+
+
+def test_partial_span_is_lossless(session_store, monkeypatch):
+    """Fails if save() slices the tail with [-TAIL_KEEP:] instead of deriving it from the manifest:
+    with the second chunk of a span refused, the messages between would vanish from the head."""
+    monkeypatch.setattr(M, "_SIDECAR_CHUNK_MAX_MSGS", 8)
+    real = M._seal_chunk
+    calls = {"n": 0}
+
+    def flaky(sid, seq, msgs, first_idx):
+        calls["n"] += 1
+        return None if calls["n"] == 2 else real(sid, seq, msgs, first_idx)
+
+    monkeypatch.setattr(M, "_seal_chunk", flaky)
+    s = M.Session(session_id="ps", title="T", workspace=str(session_store.parent), model="glm", messages=[_msg(i) for i in range(30)])
+    s.save(touch_updated_at=False, skip_index=True)
+    man = _manifest(session_store, "ps")
+    head = json.loads((session_store / "ps.json").read_bytes())
+    assert len(man) == 1 and man[0]["count"] == 8, "one chunk landed, the second was refused"
+    assert M._sealed_total(man) + len(head["messages"]) == 30, "the refused span's messages stayed in the head"
+    M.SESSIONS.clear()
+    assert len(M.Session.load("ps").messages) == 30
+
+
+def test_a_tail_only_grow_still_writes_no_chunk(session_store, monkeypatch):
+    """Fails if the rewrite re-seals on every save (the common path must be untouched)."""
+    s = _segmented(session_store, "tg", n=30)
+    seals = []
+    monkeypatch.setattr(M, "_seal_chunk", lambda *a: seals.append(a) or None)
+    s.messages = s.messages + [_msg(30)]
+    s.save(touch_updated_at=False, skip_index=True)
+    assert seals == []
