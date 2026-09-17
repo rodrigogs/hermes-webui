@@ -206,3 +206,39 @@ def test_a_segmented_save_is_read_free(session_store, monkeypatch):
         f"a segmented grow-save read {reads['n']} session file(s); the stat-identity "
         "fast path is meant to make it read-free"
     )
+
+
+def test_a_mid_history_edit_costs_the_history_after_it_not_all_of_it(session_store, monkeypatch):
+    """Fails if a re-seal goes back to rewriting the whole prefix: bytes written after an edit in
+    the last sealed chunk must be well under a full-prefix rewrite. Cap derived from the fixture;
+    the test checks its own separation first, like its siblings.
+
+    Edit position: the fixture (12,000 messages, chunk cap 2,000, tail keep 500) actually seals
+    into 6 chunks -- five of 2,000 plus one of 1,500 (11,500 sealed, not the 5-of-2,000-plus-500
+    "10,500 sealed" the plan sketched, which is 1,500 messages short of this fixture's 12,000).
+    Editing man[2] (third of six) leaves ~8,000 of 11,500 sealed messages after the edit -- 4x
+    that is already bigger than a full-prefix rewrite, so the self-check below cannot pass for
+    ANY fixture size with this margin while len(man) >= 5 also holds (it is a ratio of the edit's
+    position to the sealed length, not a size the fixture can be grown or shrunk past). Editing
+    man[-1] instead -- the last SEALED chunk, still distinct from the never-chunked tail -- leaves
+    only ~2,000 messages after the edit, which does clear the margin, while still exercising the
+    same reseal-from-the-first-divergent-chunk path and still keeping chunks 0 and 1 untouched.
+    """
+    monkeypatch.setattr(M, "_SIDECAR_CHUNK_MAX_MSGS", 2000)
+    msgs = [{"role": "user", "timestamp": float(i), "content": f"m {i} " + "x" * 200} for i in range(12000)]
+    s = M.Session(session_id="edit", title="T", workspace=str(session_store.parent), model="glm", messages=list(msgs))
+    s.save()                                                     # 5 chunks of 2000 + 1 of 1500 + 500 tail (11500 sealed)
+    man = M._normalised_manifest(json.loads(s.path.read_bytes())["message_chunks"])
+    assert len(man) >= 5, f"fixture must have >= 5 chunks, has {len(man)}"
+    edit_at = man[-1]["first_idx"] + 7
+    written = _spy_bytes_written(monkeypatch, session_store)
+    s.messages = s.messages[:edit_at] + s.messages[edit_at + 1:]
+    s.save()
+    per_msg = len(json.dumps(msgs[0], ensure_ascii=False, indent=2).encode()) + 8
+    after_edit = len(msgs) - edit_at
+    full_prefix = len(msgs) - M._SIDECAR_TAIL_KEEP
+    cap = per_msg * after_edit * 2 + 64 * 1024                   # generous: 2x what a re-seal from the last chunk writes
+    assert cap * 2 < per_msg * full_prefix, "the cap must sit well below a full-prefix rewrite or this test cannot fail"
+    assert written["n"] < cap, f"a mid-history edit wrote {written['n']:,} B (cap {cap:,}); the re-seal went back to O(history)"
+    kept = M._normalised_manifest(json.loads(s.path.read_bytes())["message_chunks"])
+    assert [e["file"] for e in kept[:2]] == [e["file"] for e in man[:2]]
