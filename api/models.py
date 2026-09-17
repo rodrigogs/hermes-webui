@@ -2027,6 +2027,10 @@ class Session:
             logger.info('sidecar %s: chunk_errors while the head changed; re-reading (%d/3)', sid, _retry + 1)
             _pre_read_sig = _sidecar_stat_signature(p)
             _pre_read_identity = _now
+            # Release the previous reassembled document BEFORE building the next
+            # one: on the 203 MB session two live copies of the history is the
+            # difference between a load and an OOM kill (5.9 GiB VM, no swap).
+            data = None
             data = _read_sidecar_document(p, sid)
         if data is None:
             return None
