@@ -497,6 +497,13 @@ def gc_sessions(session_dir=None, *, apply=False, min_age_s=900, webui_stopped=F
         if live is None:
             report['manifest_unreadable'].append(sid)
             continue
+        # Captured now, at the entry read, so the per-unlink guard below can
+        # tell "this directory entered the loop unmanifested (its live set
+        # was already empty, e.g. via include_unmanifested=True)" from "this
+        # directory entered manifested and went empty MID-PASS" -- the flag
+        # alone cannot make that distinction, and conflating the two is
+        # exactly what let a mid-pass emptied manifest slip past the guard.
+        entered_manifested = bool(live)
         bak_referenced, bak_err = _bak_manifest_files(head)
         if bak_err:
             report['manifest_unreadable'].append(f'{sid} (.bak: {bak_err})')
@@ -544,9 +551,12 @@ def gc_sessions(session_dir=None, *, apply=False, min_age_s=900, webui_stopped=F
                 # as "references nothing" would unlink every remaining
                 # candidate -- exactly the unmanifested directory shape
                 # this function otherwise refuses to touch -- so it is
-                # refused here too UNLESS the operator already opted into
-                # treating an unmanifested directory as fair game.
-                if live_now is None or f.name in live_now or (not live_now and not include_unmanifested):
+                # refused here too, but ONLY when this directory entered the
+                # loop manifested: a directory that entered UNMANIFESTED (its
+                # live set was already empty, via include_unmanifested=True)
+                # stays reclaimable -- the refusal is scoped to the
+                # directory's entry state, never to the whole-run flag.
+                if live_now is None or f.name in live_now or (not live_now and entered_manifested):
                     continue
                 try:
                     f.unlink()

@@ -186,6 +186,30 @@ def test_emptied_manifest_mid_pass_refuses_the_remaining_candidates(session_stor
     assert sorted(_chunks(session_store, "gb")) == sorted([live, "000002.json", "000003.json"])
 
 
+def test_emptied_manifest_mid_pass_is_refused_even_with_include_unmanifested(session_store, monkeypatch):
+    """Fails if the mid-pass refusal is scoped to the whole-run
+    `include_unmanifested` flag instead of the directory's ENTRY state: a
+    directory that entered the loop manifested (non-empty live set at the
+    top-of-loop read) and only goes empty mid-pass must be refused
+    regardless of `include_unmanifested`, because that flag describes a
+    directory that started unmanifested, not one that became so. Fails
+    either by re-adding the `not include_unmanifested` exemption to the
+    per-unlink guard, or by dropping `entered_manifested` and gating on the
+    flag again."""
+    _, live = _orphaned(session_store, "gc5")
+    real = SM._live_manifest_files_from_prefix
+    calls = {"n": 0}
+
+    def truthful_once_then_empty(head):
+        calls["n"] += 1
+        return real(head) if calls["n"] == 1 else set()
+
+    monkeypatch.setattr(SM, "_live_manifest_files_from_prefix", truthful_once_then_empty)
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True, include_unmanifested=True)
+    assert rep["reclaimed"] == 0
+    assert sorted(_chunks(session_store, "gc5")) == sorted([live, "000002.json", "000003.json"])
+
+
 def test_hwm_write_failure_leaves_every_orphan_in_place(session_store, monkeypatch):
     """Fails if gc unlinks any candidate when `_write_seq_hwm` cannot durably
     write the mark -- the mark must land before anything is removed, and a
