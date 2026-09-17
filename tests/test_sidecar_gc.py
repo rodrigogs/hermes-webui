@@ -150,14 +150,17 @@ def test_reread_before_unlink_skips_a_file_the_head_started_naming(session_store
 
 
 def test_gc_reads_heads_through_the_cheap_prefix_only(session_store, monkeypatch):
-    """Fails if gc parses a head with read_bytes/json.loads instead of _read_metadata_json_prefix
-    (the unbounded read that killed the webui twice)."""
+    """Fails if gc parses a head -- or its `.bak` -- with read_bytes/json.loads
+    instead of _read_metadata_json_prefix (the unbounded read that killed the
+    webui twice; the restored `.bak` of the archived production session is
+    203 MB, and on a 5.9 GiB swapless VM reading it whole is an OOM kill)."""
     _orphaned(session_store, "ga")
+    (session_store / "ga.json.bak").write_bytes((session_store / "ga.json").read_bytes())
     real = SM.Path.read_bytes
 
     def no_head_reads(self):
-        if self.name == "ga.json":
-            raise MemoryError("gc must not read a live head whole")
+        if self.name in ("ga.json", "ga.json.bak"):
+            raise MemoryError("gc must not read a live head or its .bak whole")
         return real(self)
 
     monkeypatch.setattr(SM.Path, "read_bytes", no_head_reads)

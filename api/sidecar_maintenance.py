@@ -42,13 +42,24 @@ def _bak_manifest_files(head) -> tuple[set, str | None]:
     EXISTS but could not be read or parsed. A caller must not treat "no
     `.bak`" and "an unreadable `.bak`" the same way: the first means nothing
     needs excluding, the second means a chunk's need cannot be RULED OUT and
-    must be treated as still referenced.
+    must be treated as still referenced. A `.bak` whose METADATA parses is
+    ruled out even if its `messages` array is torn: the manifest is the whole
+    question here, and the prefix read below answers it without the array.
     """
     bak_path = head.with_suffix('.json.bak')
     if not bak_path.exists():
         return set(), None
     try:
-        bak_doc = json.loads(bak_path.read_bytes())
+        # Through the CHEAP PREFIX first. `message_chunks` is written before
+        # `messages` in every head this code writes, and a `.bak` IS a head, so
+        # the 1 MiB prefix carries the whole manifest -- everything this function
+        # needs. The full parse was the one unbounded read left in the
+        # maintenance tools: the restored `.bak` of the archived production
+        # session is 203 MB, and on a 5.9 GiB swapless VM reading it whole is an
+        # OOM kill. Fall back to the full parse only when the prefix cannot be
+        # had (no top-level `messages` key, or metadata past the budget).
+        prefix = M._read_metadata_json_prefix(bak_path)
+        bak_doc = json.loads(prefix if prefix is not None else bak_path.read_bytes())
     except Exception as exc:
         return set(), f'.bak unreadable ({exc.__class__.__name__})'
     if not isinstance(bak_doc, dict):
