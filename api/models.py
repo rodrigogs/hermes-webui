@@ -4885,10 +4885,13 @@ def _write_seq_hwm(sid, value) -> bool:
     d = _session_chunk_dir(sid)
     if d is None:
         return False
+    # Bound BEFORE the try so the cleanup in the except branch can always reach
+    # it -- a name computed inside the try is out of scope exactly when a failure
+    # left a file under it.
+    tmp = d / f'{_SEQ_HWM_NAME}.tmp.{os.getpid()}.{threading.current_thread().ident}'
     try:
         d.mkdir(parents=True, exist_ok=True)
         value = max(int(value), _read_seq_hwm(sid))
-        tmp = d / f'{_SEQ_HWM_NAME}.tmp.{os.getpid()}.{threading.current_thread().ident}'
         with open(tmp, 'w', encoding='utf-8') as f:
             f.write(str(value))
             f.flush()
@@ -4896,6 +4899,12 @@ def _write_seq_hwm(sid, value) -> bool:
         os.replace(tmp, d / _SEQ_HWM_NAME)
         return True
     except (OSError, ValueError):
+        # Same cleanup _seal_chunk does: a tmp that will never be renamed is
+        # litter nothing collects, and every deleter and every re-seal calls this.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
         logger.error('sidecar %s: could not write %s', sid, _SEQ_HWM_NAME, exc_info=True)
         return False
 

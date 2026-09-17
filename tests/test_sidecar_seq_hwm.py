@@ -86,6 +86,22 @@ def test_a_freed_number_is_not_reissued_after_a_deleter_raised_the_mark(session_
     assert min(int(n[:6]) for n in names) >= 2
 
 
+def test_a_failed_mark_write_leaves_no_tmp_behind(session_store, monkeypatch):
+    """Fails if `_write_seq_hwm`'s except branch stops unlinking its tmp (or `tmp`
+    is bound inside the try, where the cleanup cannot reach it): every deleter
+    and every re-seal calls this, so a persistently failing replace litters the
+    chunk directory with `.seq_hwm.tmp.*` files nothing ever collects."""
+    _segmented(session_store, "h6", n=30)
+    d = session_store / "h6.msgs"
+
+    def boom(src, dst):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(M.os, "replace", boom)
+    assert M._write_seq_hwm("h6", 4) is False
+    assert list(d.glob(".seq_hwm.tmp*")) == [], f"tmp left behind: {list(d.glob('.seq_hwm.tmp*'))}"
+
+
 def test_a_chunk_vanished_before_save_never_has_its_number_reissued(session_store):
     """The reviewer's probe. Fails if `_sealed_layout` stops raising the mark for
     the manifest entries it drops: the released number is reissued to genuinely
