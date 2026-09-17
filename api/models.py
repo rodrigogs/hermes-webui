@@ -4691,6 +4691,36 @@ def _structural_key(msg):
     return (msg.get('role'), ts, len(content) if isinstance(content, str) else 0)
 
 
+def _structural_key_v2(msg):
+    """v2 of _structural_key: the v1 tuple plus a 12-hex digest of content and reasoning.
+
+    v1 keys on (role, timestamp, len(content)) and cannot see a `reasoning`
+    edit or a same-length content edit. `attach_display_reasoning` (journal
+    recovery, this module) writes message['reasoning'] on an EXISTING message,
+    which can sit inside a sealed chunk; under v1 that edit was never
+    persisted because the chunk never re-sealed. The digest covers exactly the
+    keys that function writes: 'reasoning'. Never raises.
+    """
+    role, ts, n = _structural_key(msg)
+    if not isinstance(msg, dict):
+        return (role, ts, n, '')
+    try:
+        raw = json.dumps([msg.get('content'), msg.get('reasoning')], sort_keys=True,
+                         ensure_ascii=False, default=str).encode('utf-8')
+        digest = hashlib.sha256(raw).hexdigest()[:12]
+    except (TypeError, ValueError):
+        digest = ''
+    return (role, ts, n, digest)
+
+
+_STRUCTURAL_KEY_FNS = {1: _structural_key, 2: _structural_key_v2}
+
+
+def _entry_key_fn(entry):
+    """The key function a manifest entry was sealed with (`key_v`; absent = 1), or None if unknown."""
+    return _STRUCTURAL_KEY_FNS.get(entry.get('key_v', 1))
+
+
 def _sealed_total(manifest) -> int:
     """Number of messages held in sealed chunks, 0 for anything malformed."""
     if not isinstance(manifest, list):
@@ -4859,73 +4889,88 @@ def _seal_chunk(sid, seq, msgs, first_idx):
     # instead of O(len(messages)) -- see _manifest_matches_memory. Stored as
     # lists because JSON has no tuples; compared after tuple(...).
     return {'seq': int(seq), 'file': path.name, 'count': len(msgs),
-            'first_idx': int(first_idx), 'sha256': _sha256_hex(raw),
-            'first_key': list(_structural_key(msgs[0])) if msgs else None,
-            'last_key': list(_structural_key(msgs[-1])) if msgs else None}
+            'first_idx': int(first_idx), 'sha256': _sha256_hex(raw), 'key_v': 2,
+            'first_key': list(_structural_key_v2(msgs[0])) if msgs else None,
+            'last_key': list(_structural_key_v2(msgs[-1])) if msgs else None}
+
+
+def _matching_manifest_prefix(manifest, messages):
+    """The longest prefix of `manifest` whose chunks still describe `messages`.
+
+    O(len(manifest)): each entry carries the structural key of its first and
+    last message. Where `_manifest_matches_memory` said "False" at the first
+    divergent entry, this returns the entries BEFORE it, so a re-seal can keep
+    them and seal only from where memory and disk part ways. An entry that
+    cannot be verified -- count <= 0, missing keys, an unknown `key_v` -- ends
+    the prefix, exactly as it failed the whole before. `manifest` is expected
+    normalised (`_normalised_manifest`).
+    """
+    msgs = messages or []
+    out = []
+    for entry in manifest or []:
+        first_idx = entry['first_idx']
+        if entry['count'] <= 0:
+            break
+        last_idx = first_idx + entry['count'] - 1
+        if last_idx >= len(msgs):
+            break
+        want_first, want_last = entry.get('first_key'), entry.get('last_key')
+        key_fn = _entry_key_fn(entry)
+        if want_first is None or want_last is None or key_fn is None:
+            break
+        if tuple(want_first) != key_fn(msgs[first_idx]) or tuple(want_last) != key_fn(msgs[last_idx]):
+            break
+        out.append(entry)
+    return out
+
+
+def _reusable_manifest_prefix(sid, manifest, messages):
+    """`_matching_manifest_prefix`, cut again at the first chunk file that is not on disk.
+
+    What survives can be republished verbatim. A head must never name a file
+    that is not there (spec 2026-09-17 §3.5); this is the same shape as
+    `api/streaming._adoptable_manifest`, applied on every save.
+    """
+    d = _session_chunk_dir(sid)
+    keep = []
+    for entry in _matching_manifest_prefix(manifest, messages):
+        fname = entry.get('file')
+        if d is None or not isinstance(fname, str) or Path(fname).name != fname:
+            break
+        try:
+            os.stat(d / fname)
+        except OSError:
+            break
+        keep.append(entry)
+    return keep
 
 
 def _manifest_matches_memory(manifest, messages) -> bool:
-    """True when the in-memory array still starts with the sealed prefix.
+    """True when the in-memory array still starts with the whole sealed prefix.
 
-    O(len(manifest)), not O(len(messages)): each entry carries the structural
-    key of its first and last message, so this is a handful of comparisons even
-    for a 250,000-message session.
-
-    KNOWN RESIDUAL, stated plainly because the earlier wording understated it.
-    Only each chunk's FIRST and LAST message are keyed; the interior is never
-    looked at. So:
-
-    * an edit to an interior message that does not change the array's LENGTH is
-      not detected at all, whatever it changes -- role, timestamp and content
-      included. It is not merely edits that "preserve the key";
-    * a boundary edit is detected unless it preserves all three of role,
-      timestamp and len(content) -- i.e. unless it is the same message.
-
-    Anything that shifts or truncates the array IS detected, via the length
-    check and the boundary indices, and that covers the paths that actually
-    rewrite history: the #2592 collapse, /api/session/clear, intentional
-    shrinks, truncation watermarks, and edit-and-resend (which truncates).
+    KNOWN RESIDUAL. Only each chunk's FIRST and LAST message are keyed; an
+    edit to an interior message that changes neither the array's length nor a
+    boundary message is not detected. Anything that shifts or truncates the
+    array IS detected. v2 keys (_structural_key_v2) additionally see content
+    and reasoning edits at the boundaries.
 
     Two paths edit messages in place. `_try_retry_journal_recovery_in_place`
     (api/models.py) walks back from the end and stops at the first ordinary
     assistant message, so it stays in the tail; but it can attach `reasoning`
-    to a message INSIDE a sealed chunk, and the boundary key here --
+    to a message INSIDE a sealed chunk. A v1 boundary key --
     `(role, timestamp, len(content))` -- cannot see that: none of those three
-    fields change when `reasoning` is merely attached to a message. Detecting
-    it would need a key that looks at content, not just the boundary.
-    `_merge_display_messages_after_agent_result` (api/streaming.py) used to
-    filter the WHOLE array every turn and was the cause of every production
-    re-seal on 2026-09-17; since C1 its filters run over the unsealed suffix
-    only, and only its backfill (rare, logged) can still reach sealed history.
+    fields change when `reasoning` is merely attached to a message. A v2
+    boundary key can, because it also digests `content` and `reasoning`; an
+    older chunk's v1 entries keep matching under v1 rules regardless, so
+    nothing re-seals on upgrade. `_merge_display_messages_after_agent_result`
+    (api/streaming.py) used to filter the WHOLE array every turn and was the
+    cause of every production re-seal on 2026-09-17; since C1 its filters run
+    over the unsealed suffix only, and only its backfill (rare, logged) can
+    still reach sealed history.
     """
     if not manifest:
         return True
-    msgs = messages or []
-    if len(msgs) < _sealed_total(manifest):
-        return False
-    for entry in manifest:
-        first_idx = entry['first_idx']
-        if entry['count'] <= 0:
-            # _normalised_manifest tolerates count == 0 (it only rejects < 0),
-            # and this loop's last_idx would then be first_idx - 1 -- i.e. a
-            # negative index that silently reads the wrong end of the array.
-            # Nothing here writes an empty chunk, so such an entry is corrupt
-            # or hand-edited: unverifiable, therefore untrusted.
-            return False
-        last_idx = first_idx + entry['count'] - 1
-        if last_idx >= len(msgs):
-            return False
-        want_first = entry.get('first_key')
-        want_last = entry.get('last_key')
-        if want_first is None or want_last is None:
-            # A chunk sealed before the keys existed: cannot be checked, so it
-            # cannot be trusted either.
-            return False
-        if tuple(want_first) != _structural_key(msgs[first_idx]):
-            return False
-        if tuple(want_last) != _structural_key(msgs[last_idx]):
-            return False
-    return True
+    return len(_matching_manifest_prefix(manifest, messages)) == len(manifest)
 
 
 def _legacy_sidecar_facts_get(sid):
