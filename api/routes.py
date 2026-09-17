@@ -24683,6 +24683,7 @@ def _handle_chat_sync(handler, body):
                 _restore_display_reasoning_metadata,
                 _restore_reasoning_metadata,
                 _sanitize_messages_for_agent,
+                _sealed_prefix_len_for,
                 _compact_session_image_parts_for_persistence,
                 _context_messages_for_new_turn,
                 _workspace_context_prefix,
@@ -24760,6 +24761,7 @@ def _handle_chat_sync(handler, body):
             _restore_display_reasoning_metadata(_previous_messages, _result_messages),
             msg,
             source=getattr(s, "pending_user_source", None) or "webui",
+            sealed_prefix_len=_sealed_prefix_len_for(s),
         )
         _compact_session_image_parts_for_persistence(s)
         # Only auto-generate title when still default; preserves user renames

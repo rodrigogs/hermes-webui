@@ -4886,13 +4886,15 @@ def _manifest_matches_memory(manifest, messages) -> bool:
     rewrite history: the #2592 collapse, /api/session/clear, intentional
     shrinks, truncation watermarks, and edit-and-resend (which truncates).
 
-    Two paths do edit messages in place: `_try_retry_journal_recovery_in_place`
-    (api/models.py) and `_merge_display_messages_after_agent_result`
-    (api/streaming.py). Both operate on the newest messages, which live in the
-    unsealed tail (`_SIDECAR_TAIL_KEEP` of them) rather than in a sealed chunk,
-    so in practice they do not reach sealed history. If a future path needs to
-    edit deep inside a sealed chunk, this key is not enough -- verify the
-    chunk's sha256 instead, which is already in the manifest entry.
+    Two paths edit messages in place. `_try_retry_journal_recovery_in_place`
+    (api/models.py) walks back from the end and stops at the first ordinary
+    assistant message, so it stays in the tail; but it can attach `reasoning`
+    to a message INSIDE a sealed chunk, which a v1 key cannot see -- v2 keys
+    (_structural_key_v2) exist for that. `_merge_display_messages_after_agent_result`
+    (api/streaming.py) used to filter the WHOLE array every turn and was the
+    cause of every production re-seal on 2026-09-17; since C1 its filters run
+    over the unsealed suffix only, and only its backfill (rare, logged) can
+    still reach sealed history.
     """
     if not manifest:
         return True

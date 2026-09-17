@@ -1334,7 +1334,7 @@ def _run_gateway_chat_streaming(
                 display_context,
             )
             try:
-                from api.streaming import _merge_display_messages_after_agent_result
+                from api.streaming import _merge_display_messages_after_agent_result, _sealed_prefix_len_for
 
                 s.messages = _merge_display_messages_after_agent_result(
                     display,
@@ -1342,6 +1342,7 @@ def _run_gateway_chat_streaming(
                     s.context_messages,
                     str(msg_text or ""),
                     source=pending_source,
+                    sealed_prefix_len=_sealed_prefix_len_for(s),
                 )
             except Exception:
                 logger.debug("Failed to merge gateway display transcript", exc_info=True)

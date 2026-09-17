@@ -2093,6 +2093,7 @@ def _settle_result_messages(
         msg_text,
         source=source,
         verification_nudge_provenance=verification_nudge_provenance,
+        sealed_prefix_len=_sealed_prefix_len_for(session),
     )
     _annotate_media_snapshots_for_settled_messages(session.messages)
     _compact_session_image_parts_for_persistence(session)
@@ -6907,6 +6908,11 @@ def _advance_truncation_watermark_after_commit(session) -> None:
     session.truncation_watermark = time.time()
 
 
+def _sealed_prefix_len_for(session) -> int:
+    """How many of `session.messages` are sealed in chunks; 0 for an unsegmented session."""
+    return _sealed_total(_normalised_manifest(getattr(session, '_message_chunks', None)))
+
+
 def _merge_display_messages_after_agent_result(
     previous_display,
     previous_context,
@@ -6914,6 +6920,7 @@ def _merge_display_messages_after_agent_result(
     msg_text,
     source: str = "webui",
     verification_nudge_provenance=None,
+    sealed_prefix_len: int = 0,
 ):
     """Keep UI transcript durable while allowing model context to compact.
 
@@ -6922,9 +6929,25 @@ def _merge_display_messages_after_agent_result(
     has the prior context as a prefix, keep the previous UI transcript and append
     the current user turn onward. Synthetic compaction/reference markers remain
     internal recovery material and must not become visible user/assistant turns.
+
+    `sealed_prefix_len`: the first N messages are sealed in immutable sidecar
+    chunks. The filters below used to run over the WHOLE array, and any removal
+    below the sealed boundary shifted every later index, so the next save()
+    found its sealed prefix no longer matched and re-sealed the entire history
+    (2026-09-17: two 5 MB full re-seals in one minute on one session). They
+    now run over the unsealed suffix only. With the default 0 -- an
+    unsegmented session, or a caller that does not pass it -- this is
+    byte-for-byte the previous behaviour. The backfill further down is left
+    whole-array on purpose (it restores turns hidden behind a compaction
+    marker at their true position and runs only after a compression
+    recovery); when it inserts below the boundary it logs, and save() pays a
+    bounded re-seal from there.
     """
+    previous_display = list(previous_display or [])
+    _boundary = min(max(int(sealed_prefix_len or 0), 0), len(previous_display))
+    _sealed_prefix = previous_display[:_boundary]
     previous_display = [
-        m for m in list(previous_display or [])
+        m for m in previous_display[_boundary:]
         if not _is_context_compression_marker(m)
         and not _is_compressed_context_tool_result_summary_message(m)
     ]
@@ -6960,7 +6983,7 @@ def _merge_display_messages_after_agent_result(
             "Deduplicated %d stale _partial messages from previous_display (was %d, now %d)",
             len(previous_display) - len(_deduped), len(previous_display), len(_deduped),
         )
-    previous_display = _deduped
+    previous_display = _sealed_prefix + _deduped
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
     if isinstance(verification_nudge_provenance, dict):
@@ -7108,6 +7131,14 @@ def _merge_display_messages_after_agent_result(
                     len(previous_display),
                     len(_backfilled),
                 )
+                if _boundary and _backfilled[:_boundary] != _sealed_prefix:
+                    # A row landed below the sealed boundary: the next save()
+                    # re-seals from there (bounded, spec 2026-09-17 §3.4). Logged
+                    # so the frequency is measured in production.
+                    logger.info(
+                        "merge backfill inserted below the sealed boundary (%d) of a %d-message transcript; "
+                        "the next save re-seals from there", _boundary, len(_backfilled),
+                    )
                 previous_display = _backfilled
 
     if _messages_have_prefix(result_messages, previous_context):
@@ -7395,6 +7426,7 @@ def _merged_transcript_lacks_final_assistant_answer(
     source: str = "webui",
     drop_replayed_assistant: bool = False,
     active_turn_identity=None,
+    sealed_prefix_len: int = 0,
 ) -> bool:
     """Return True when the current turn still lacks a final assistant answer."""
     previous_display = list(previous_display or [])
@@ -7414,6 +7446,7 @@ def _merged_transcript_lacks_final_assistant_answer(
             'verification_nudge_seen': _verification_nudge_seen,
             'active_turn_identity': active_turn_identity,
         },
+        sealed_prefix_len=sealed_prefix_len,
     )
     return _turn_transcript_lacks_final_assistant_answer(
         merged_messages,
@@ -11236,6 +11269,7 @@ def _run_agent_streaming(
                     source=getattr(s, 'pending_user_source', None) or 'webui',
                     drop_replayed_assistant=_drop_replayed_assistant,
                     active_turn_identity=_active_turn_identity,
+                    sealed_prefix_len=_sealed_prefix_len_for(s),
                 )
                 if (
                     not _all_result_messages
