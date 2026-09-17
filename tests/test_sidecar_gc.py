@@ -163,3 +163,78 @@ def test_gc_reads_heads_through_the_cheap_prefix_only(session_store, monkeypatch
     monkeypatch.setattr(SM.Path, "read_bytes", no_head_reads)
     rep = SM.gc_sessions(session_store)
     assert rep["would_reclaim"] == 2
+
+
+def test_emptied_manifest_mid_pass_refuses_the_remaining_candidates(session_store, monkeypatch):
+    """Fails if the per-unlink guard drops the `not live_now` clause: once the
+    live manifest reads back EMPTY (head went manifested -> unmanifested
+    between the top-of-loop read and this unlink -- a violated
+    webui-stopped precondition, but this is the only deletion path, so it
+    must hold anyway), that must not be read as "references nothing" and
+    used to unlink every remaining candidate."""
+    _, live = _orphaned(session_store, "gb")
+    real = SM._live_manifest_files_from_prefix
+    calls = {"n": 0}
+
+    def truthful_once_then_empty(head):
+        calls["n"] += 1
+        return real(head) if calls["n"] == 1 else set()
+
+    monkeypatch.setattr(SM, "_live_manifest_files_from_prefix", truthful_once_then_empty)
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True)
+    assert rep["reclaimed"] == 0
+    assert sorted(_chunks(session_store, "gb")) == sorted([live, "000002.json", "000003.json"])
+
+
+def test_hwm_write_failure_leaves_every_orphan_in_place(session_store, monkeypatch):
+    """Fails if gc unlinks any candidate when `_write_seq_hwm` cannot durably
+    write the mark -- the mark must land before anything is removed, and a
+    write failure means it did not."""
+    _, live = _orphaned(session_store, "gh")
+    monkeypatch.setattr(M, "_write_seq_hwm", lambda sid, v: False)
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True)
+    assert rep["reclaimed"] == 0
+    assert sorted(_chunks(session_store, "gh")) == sorted([live, "000002.json", "000003.json"])
+    row = rep["sessions"][0]
+    assert ".seq_hwm" in row.get("error", "")
+
+
+def test_a_head_that_will_not_parse_is_reported_unreadable_and_untouched(session_store):
+    """Fails if gc treats a head that fails to parse as an empty (== fully
+    unmanifested) manifest instead of refusing the session as unreadable."""
+    _, live = _orphaned(session_store, "gi")
+    head = session_store / "gi.json"
+    head.write_bytes(b"{not json")
+    _age(head, 3600)
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True)
+    assert "gi" in rep["manifest_unreadable"]
+    assert sorted(_chunks(session_store, "gi")) == sorted([live, "000002.json", "000003.json"])
+
+
+def test_a_bak_that_will_not_parse_is_reported_unreadable_and_untouched(session_store):
+    """Fails if gc computes candidates when `_bak_manifest_files` cannot rule
+    out what an unreadable .bak still needs -- an unreadable .bak must block
+    the whole session, not just the files it happens to name."""
+    _, live = _orphaned(session_store, "gj")
+    (session_store / "gj.json.bak").write_bytes(b"{corrupt")
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True)
+    entry = next((e for e in rep["manifest_unreadable"] if e.startswith("gj")), None)
+    assert entry is not None and ".bak" in entry
+    assert sorted(_chunks(session_store, "gj")) == sorted([live, "000002.json", "000003.json"])
+
+
+def test_include_unmanifested_reclaims_an_unreferenced_chunk_dir(session_store):
+    """Fails if `include_unmanifested=True` does not actually enable reclaiming
+    a directory whose head no longer carries a message_chunks manifest --
+    the same shape `test_archived_headless_and_unmanifested_dirs_are_skipped`
+    proves is left alone WITHOUT the flag."""
+    _orphaned(session_store, "gk")
+    head_path = session_store / "gk.json"
+    head = json.loads(head_path.read_bytes())
+    head.pop("message_chunks")
+    head["messages"] = [_msg(i) for i in range(30)]
+    head_path.write_text(json.dumps(head), encoding="utf-8")
+    _age(head_path, 3600)
+    rep = SM.gc_sessions(session_store, apply=True, webui_stopped=True, include_unmanifested=True)
+    assert rep["reclaimed"] == 3
+    assert _chunks(session_store, "gk") == []

@@ -536,7 +536,17 @@ def gc_sessions(session_dir=None, *, apply=False, min_age_s=900, webui_stopped=F
                 continue
             for f, size in candidates:
                 live_now = _live_manifest_files_from_prefix(head)
-                if live_now is None or f.name in live_now:
+                # An empty `live_now` here means the head went from
+                # manifested to unmanifested BETWEEN the top-of-loop read
+                # and this unlink (a concurrent unchunk_session/materialize
+                # -- a violated webui-stopped precondition, but this is the
+                # only deletion path, so it must hold anyway). Reading that
+                # as "references nothing" would unlink every remaining
+                # candidate -- exactly the unmanifested directory shape
+                # this function otherwise refuses to touch -- so it is
+                # refused here too UNLESS the operator already opted into
+                # treating an unmanifested directory as fair game.
+                if live_now is None or f.name in live_now or (not live_now and not include_unmanifested):
                     continue
                 try:
                     f.unlink()
