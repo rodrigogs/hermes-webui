@@ -30,6 +30,25 @@ This RFC defines a consistency contract for those layers. It complements the
 larger run adapter direction in #1925 by documenting what must remain coherent
 while WebUI still has multiple overlapping state stores.
 
+## Inactive compression continuation recovery
+
+The Agent profile's SQLite compression lineage owns the canonical continuation,
+including when Desktop/CLI compressed a session without updating WebUI's
+`pre_compression_snapshot` sidecar flag. `GET /api/session` may expose the
+existing `continuation_session_id` hint from that read-only lineage. Automatic
+`idle_timeout` closure does not hide the continuation; explicit/unknown terminal
+reasons, foreign-profile rows and delegated/tool children do not authorize it.
+This read does not reopen sessions or copy ancestor display history into context.
+
+A stale `POST /api/chat/start` returns HTTP 409 with `code=session_rotated`
+and the continuation hint before workspace, model, pending-turn or worker
+mutation. The browser loads the continuation through normal session access
+checks and restores the rejected text and attachments as a draft. The user
+sends again explicitly; there is no automatic POST replay or migration of the
+parent's workspace binding. Clients without this handling must reload the
+session before retrying. Server wakeups, regeneration semantics and Gateway
+routing are not silently retargeted by this recovery path.
+
 ## Goals
 
 - Define the state layers involved in active and recovered WebUI turns.
@@ -112,6 +131,23 @@ and 5; it does not mark every run-state boundary implemented.
    Visible interim assistant progress must remain visible timeline content; a
    compact Activity disclosure may summarize adjacent tool/debug detail, but it
    must not be the only place where the user can see emitted progress text.
+   Interim assistant text that duplicates the tail of the accumulated reasoning
+   transcript is stripped from the reasoning copy so the restored snapshot
+   shows the content once. That echo match is whitespace-insensitive and
+   carries no fixed search window: a compact-equivalent suffix is recognized
+   however much interior whitespace stretches its raw span. Both consumers
+   (the live-stream echo path and the journal replay in `api/routes.py`)
+   match through an incremental folded index (`_CompactEchoIndex` in
+   `api/streaming.py`): the folded view and its raw cut offsets are built as
+   each chunk is appended, so a probe costs O(len(candidate)) and never
+   rescans the transcript's whitespace. The retired windowed variants could
+   drop the strip when the span exceeded the window, duplicating the interim
+   text; the retired raw backward walk was correct but re-walked the span per
+   interim event, quadratic on whitespace-heavy transcripts. Regressions:
+   `tests/test_live_snapshot_echo_dedup.py` pins the single-occurrence
+   result, `tests/test_live_snapshot_echo_scan_scaling.py` pins the scaling
+   property (a fixed-size fixture cannot catch a per-interim rescan), and
+   `tests/test_compact_echo_index.py` pins index/oracle equivalence.
 6. **Compression is not current intent.** Automatic compression summaries and
    reference cards are recovery/handoff material. They must not be treated as a
    new user request, active-turn content, or the default visible explanation for
