@@ -295,7 +295,7 @@ def test_route_cap_bounds_imported_sidecar_assigned_rows(fake_hermes_home):
     assert kept[0]["session_id"] == "imported-0000"
     # The recent window still renders normally; only the overflow is chip-only.
     visible = [row for row in kept if not row.get("default_hidden")]
-    assert len(visible) == routes.CLI_VISIBLE_SESSION_CAP
+    assert len(visible) == routes._cli_visible_session_cap()
     # Capping never mutates the caller's rows.
     assert not any("default_hidden" in row for row in sidecars)
 
@@ -1228,7 +1228,7 @@ def test_sidecar_carried_assignment_does_not_spend_an_unassigned_slot(
     unassigned_cli = [
         row for row in kept if row.get("is_cli_session") and not row.get("project_id")
     ]
-    assert len(unassigned_cli) == routes.CLI_VISIBLE_SESSION_CAP == 20
+    assert len(unassigned_cli) == routes._cli_visible_session_cap() == 20
     # The three genuinely unassigned conversations at the bottom of state.db are
     # what the lost slots cost: they were never fetched.
     kept_ids = {row["session_id"] for row in kept}
@@ -1341,7 +1341,7 @@ def test_sidecar_moves_below_the_window_still_deliver_the_full_window(
 
     kept = _sidebar_rows_after_route(sessions, moved)
     unassigned_cli = _unassigned_cli_ids(kept)
-    assert len(unassigned_cli) == routes.CLI_VISIBLE_SESSION_CAP == 20
+    assert len(unassigned_cli) == routes._cli_visible_session_cap() == 20
     # Newest-first, skipping every moved conversation: the 20th unassigned
     # conversation is exactly the tail row above.
     expected = [
