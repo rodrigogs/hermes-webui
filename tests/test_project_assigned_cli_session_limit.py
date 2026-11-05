@@ -300,6 +300,42 @@ def test_route_cap_bounds_imported_sidecar_assigned_rows(fake_hermes_home):
     assert not any("default_hidden" in row for row in sidecars)
 
 
+def test_route_cap_composes_with_configured_window(fake_hermes_home, monkeypatch):
+    """The assigned-retention layer rides on the CONFIGURED sidebar window.
+
+    master made the window configurable (HERMES_WEBUI_VISIBLE_SESSION_LIMIT,
+    #7631); the project-assigned caps must compose with whatever it resolves
+    to, not with a hard-coded 20. With the window at 5, 8 assigned rows stay
+    chip-reachable but only the 5 newest render in the recent window.
+    """
+    from api import config as api_config
+
+    monkeypatch.setattr(api_config, "CLI_VISIBLE_SESSION_LIMIT", 5)
+    monkeypatch.setattr(models, "CLI_VISIBLE_SESSION_LIMIT", 5)
+    sidecars = [
+        {
+            "session_id": f"configured-{index:04d}",
+            "is_cli_session": True,
+            "project_id": "project-configured",
+        }
+        for index in range(8)
+    ]
+
+    kept = routes._cap_recent_cli_sessions(sidecars)
+
+    # Assigned retention keeps every row chip-reachable past the window.
+    assert len(kept) == 8
+    visible = [row for row in kept if not row.get("default_hidden")]
+    chip_only = [row for row in kept if row.get("default_hidden")]
+    assert len(visible) == 5 == routes._cli_visible_session_cap()
+    # The OLDEST end of the project's history is what goes chip-only.
+    assert [row["session_id"] for row in chip_only] == [
+        "configured-0005",
+        "configured-0006",
+        "configured-0007",
+    ]
+
+
 def _assigned_project_counts(rows):
     """project_id -> kept row count, for the assigned rows only."""
     counts: dict[str, int] = {}
@@ -339,10 +375,13 @@ def test_route_cap_bounds_the_reviewers_five_project_reproduction(fake_hermes_ho
     # Bounded by a FAIR draw, not by truncating the head of the list: the rows
     # are grouped per project, so a flat `sessions[:200]` would have handed
     # project-0 every slot and left the other four unreachable — the starvation
-    # greptile rejected as P1.
+    # greptile rejected as P1. The recent window (20 rows) is RESERVED first —
+    # all of them belong to project-0 here — and the remaining 180-slot budget
+    # spreads round-robin over the undrawn rows of every project.
     counts = _assigned_project_counts(kept)
     assert len(counts) == project_count
-    assert set(counts.values()) == {routes.CLI_PROJECT_ASSIGNED_CAP // project_count}
+    assert counts["project-0"] == routes._cli_visible_session_cap() + 36
+    assert {counts[f"project-{project}"] for project in range(1, project_count)} == {36}
 
 
 def test_route_cap_splits_the_merged_budget_fairly_between_projects(fake_hermes_home):
@@ -365,15 +404,24 @@ def test_route_cap_splits_the_merged_budget_fairly_between_projects(fake_hermes_
 
     kept = routes._cap_recent_cli_sessions(rows)
 
-    half = routes.CLI_PROJECT_ASSIGNED_CAP // 2
-    assert _assigned_project_counts(kept) == {"project-a": half, "project-b": half}
+    # 20 of the 200 assigned rows are project-a's recent window, RESERVED
+    # before the draw; the remaining 180-slot budget spreads round-robin over
+    # the undrawn rows, so project-a adds 90 and project-b gets 90.
+    half = (routes.CLI_PROJECT_ASSIGNED_CAP - routes._cli_visible_session_cap()) // 2
+    assert _assigned_project_counts(kept) == {
+        "project-a": routes._cli_visible_session_cap() + half,
+        "project-b": half,
+    }
     assert len(kept) == routes.CLI_PROJECT_ASSIGNED_CAP
     # Newest first within each project: the draw keeps the head of each queue.
     kept_ids = {row["session_id"] for row in kept}
     for project in ("project-a", "project-b"):
         assert f"{project}-0000" in kept_ids
-        assert f"{project}-{half - 1:04d}" in kept_ids
-        assert f"{project}-{half:04d}" not in kept_ids
+    assert "project-a-0019" in kept_ids and "project-a-0020" in kept_ids
+    assert f"project-a-{routes._cli_visible_session_cap() + half - 1:04d}" in kept_ids
+    assert f"project-a-{routes._cli_visible_session_cap() + half:04d}" not in kept_ids
+    assert f"project-b-{half - 1:04d}" in kept_ids
+    assert f"project-b-{half:04d}" not in kept_ids
 
 
 def test_route_cap_shrinks_every_share_instead_of_dropping_projects(fake_hermes_home):
@@ -398,10 +446,95 @@ def test_route_cap_shrinks_every_share_instead_of_dropping_projects(fake_hermes_
     kept = routes._cap_recent_cli_sessions(rows)
 
     counts = _assigned_project_counts(kept)
-    assert len(kept) == routes.CLI_PROJECT_ASSIGNED_CAP
     assert len(counts) == project_count
-    assert min(counts.values()) >= 1
-    assert set(counts.values()) == {routes.CLI_PROJECT_ASSIGNED_CAP // project_count}
+    assert len(kept) == routes.CLI_PROJECT_ASSIGNED_CAP
+    assert min(counts.values()) >= 4
+    assert set(counts.values()) <= {4, 5, routes._cli_visible_session_cap() + 5}
+    # project-00's newest rows own the reserved recent window, on top of its
+    # equal share of the remaining budget.
+    assert counts["project-00"] == routes._cli_visible_session_cap() + 5
+
+
+def test_route_cap_never_drops_the_recent_window_the_base_shows(fake_hermes_home):
+    """The 2026-09-24 re-gate reproduction: the fair draw must not remove a
+    row the base displays.
+
+    11 projects x 20 sessions, with ALL 20 newest conversations in one project.
+    Spending the whole assigned budget round-robin before the recent window is
+    applied hands that project only ~19 of 200 slots; the keep loop then drops
+    its undrawn newest rows, and sessions visible on the default list today
+    appear in neither the default payload nor behind their project chip.
+
+    The fix reserves the rows the recent window itself would show (the first
+    ``cli_cap`` CLI rows in sort order, assigned or not) before the fair draw
+    spends only the remaining budget across starved projects. Assert all 20
+    newest stay in the payload, and that the draw still starves nothing else.
+    """
+    project_count = 11
+    rows = []
+    # The 20 newest sessions, all assigned to project-00 (newest-first list).
+    rows.extend(
+        {
+            "session_id": f"project-00-recent-{index:02d}",
+            "is_cli_session": True,
+            "project_id": "project-00",
+        }
+        for index in range(20)
+    )
+    # Then 20 older rows per remaining project: 11 projects x 20 sessions, the
+    # review's literal reproduction.
+    for project in range(1, project_count):
+        rows.extend(
+            {
+                "session_id": f"project-{project:02d}-{index:03d}",
+                "is_cli_session": True,
+                "project_id": f"project-{project:02d}",
+            }
+            for index in range(20)
+        )
+
+    kept = routes._cap_recent_cli_sessions(rows)
+
+    kept_ids = {row["session_id"] for row in kept}
+    missing = [f"project-00-recent-{index:02d}" for index in range(20)
+               if f"project-00-recent-{index:02d}" not in kept_ids]
+    assert not missing, f"the base shows these rows; the draw dropped {missing}"
+    counts = _assigned_project_counts(kept)
+    assert counts["project-00"] == 20
+    # The reservation consumed the recent window's share of the budget; the
+    # remaining assigned budget still reaches the other projects.
+    assert min(counts[f"project-{project:02d}"] for project in range(1, project_count)) >= 1
+    assert len(kept) <= routes.CLI_PROJECT_ASSIGNED_CAP
+
+
+def test_route_cap_reservation_spends_the_draw_budget_not_adds_to_it(fake_hermes_home):
+    """The reserved recent rows count AGAINST the assigned cap, not on top.
+
+    A cli_cap-sized recent window fully assigned to one project must leave the
+    round-robin with nothing to spend: total assigned rows in the payload stay
+    at the cap, never cap + draw.
+    """
+    rows = [
+        {
+            "session_id": f"assigned-{index:03d}",
+            "is_cli_session": True,
+            "project_id": "solo",
+        }
+        for index in range(routes.CLI_PROJECT_ASSIGNED_CAP)
+    ]
+
+    kept = routes._cap_recent_cli_sessions(rows, cli_cap=20)
+
+    # The 20 newest rows own the recent window (reserved, paid by it); the
+    # draw keeps the rest of this project's history chip-reachable up to the
+    # assigned cap — 200 assigned rows in total, only the window rendering.
+    assigned = [row for row in kept if row.get("project_id")]
+    assert len(assigned) == routes.CLI_PROJECT_ASSIGNED_CAP
+    visible = [row for row in assigned if not row.get("default_hidden")]
+    assert [row["session_id"] for row in visible] == [
+        f"assigned-{index:03d}" for index in range(20)
+    ]
+    assert all(row.get("default_hidden") for row in assigned[20:])
 
 
 def test_route_cap_bound_wins_when_projects_outnumber_slots(fake_hermes_home):
@@ -429,11 +562,16 @@ def test_route_cap_bound_wins_when_projects_outnumber_slots(fake_hermes_home):
 
     counts = _assigned_project_counts(kept)
     assert len(kept) == routes.CLI_PROJECT_ASSIGNED_CAP
-    assert set(counts.values()) == {1}
-    assert len(counts) == routes.CLI_PROJECT_ASSIGNED_CAP
+    # The recent window is reserved for the newest rows (project-000 keeps all
+    # 3 of its rows); the remaining budget still reaches one row per project —
+    # the draw never gives a project a second row while another has none.
+    assert counts["project-000"] == 3
+    assert set(counts.values()) <= {1, 2, 3}
+    assert sum(n for p, n in counts.items() if p != "project-000") == routes.CLI_PROJECT_ASSIGNED_CAP - 3
+    assert len(counts) == 186
     # The projects that keep a row are the ones with the most recent activity,
     # i.e. the head of the newest-first merged list.
-    assert counts.keys() == {
+    assert set(counts.keys()) <= {
         f"project-{project:03d}" for project in range(routes.CLI_PROJECT_ASSIGNED_CAP)
     }
 
@@ -763,6 +901,88 @@ def test_short_global_projection_still_refills_a_starved_project(
 
     assert "quiet-old" in {session["session_id"] for session in sessions}
     assert scoped_queries == [("project-quiet", per_project_limit)]
+
+
+def test_scoped_recovery_widens_when_its_own_raw_window_is_exhausted(
+    fake_hermes_home, tmp_path, monkeypatch
+):
+    """A starved project's OWN raw window can be consumed, not just the global one.
+
+    The global window's exhaustion is what triggers the project-scoped
+    follow-up, but that scoped query carries a raw candidate window of its own
+    (``limit * 8``, re-widened to ``limit * 32`` by the shared reader). A
+    lineage-heavy project fills it with compression segments, so the query
+    collapses them to one logical conversation and comes back short of
+    ``remaining`` — while an older assigned conversation of the SAME project
+    sits just beyond that window. Without the exhaustion signal the loop
+    advances to the next project and leaves this one under-delivered on every
+    rebuild, so the conversation behind the window is never recovered.
+    """
+    monkeypatch.setattr(models, "CLI_VISIBLE_SESSION_LIMIT", 5)
+    monkeypatch.setattr(models, "PROJECT_ASSIGNED_CLI_SCAN_CEILING", 20)
+    _register_projects(tmp_path, "project-busy", "project-quiet")
+    per_project_limit = 4
+    # The pass's own scan budget for two projects under a ceiling of 20.
+    scoped_scan_budget = min(per_project_limit * 2, 20)
+
+    # The starved project's remaining budget is the full per-project limit, and
+    # its scoped raw windows — 4 * 8, then 4 * 32 — are filled by its own
+    # compression segments, which collapse to a single logical conversation.
+    scoped_raw_window = per_project_limit * max(agent_sessions.CANDIDATE_WINDOW_MULTIPLIERS)
+    rows = [_session("quiet-old", BASE_TS, project_id="project-quiet")]
+    rows.extend(_lineage(
+        "quiet-chain",
+        BASE_TS + 10_000,
+        scoped_raw_window + 100,
+        project_id="project-quiet",
+        step=1.0,
+    ))
+    rows.extend(
+        _session(f"busy-{index:03d}", BASE_TS + 1000 + index, project_id="project-busy")
+        for index in range(25)
+    )
+    rows.extend(_session(f"plain-{index:02d}", BASE_TS + 9000 + index) for index in range(25))
+    _write_state_db(fake_hermes_home / "state.db", rows)
+
+    scoped_queries = []
+    real_reader = models.read_importable_agent_session_rows
+
+    def _counting_reader(*args, **kwargs):
+        if kwargs.get("project_ids"):
+            scoped_queries.append((
+                kwargs["project_ids"][0],
+                kwargs.get("limit"),
+                kwargs.get("return_window_exhaustion"),
+            ))
+        return real_reader(*args, **kwargs)
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", _counting_reader)
+
+    sessions = models._load_cli_sessions_uncached(
+        fake_hermes_home,
+        fake_hermes_home / "state.db",
+        "default",
+        project_assigned_limit=per_project_limit,
+    )
+
+    quiet = {
+        session["session_id"]
+        for session in sessions
+        if session["project_id"] == "project-quiet"
+    }
+    assert "quiet-old" in quiet, "the conversation behind the scoped raw window is lost"
+
+    # Every scoped query asks for the exhaustion signal, the binding window
+    # buys exactly ONE wider re-query, and that re-query stays inside the
+    # pass's own scan budget.
+    assert scoped_queries == [
+        ("project-quiet", per_project_limit, True),
+        ("project-quiet", scoped_scan_budget, True),
+    ], "one retry at the pass's scan budget, not a widening loop"
+    assert all(
+        limit <= models.PROJECT_ASSIGNED_CLI_SCAN_CEILING
+        for _, limit, _ in scoped_queries
+    )
 
 
 def test_saturated_window_pays_one_query_per_starved_project(
@@ -2138,20 +2358,21 @@ def test_background_source_exclusion_literal_matches_the_constant():
     """The interactive exclusion stays spelled as a tuple literal.
 
     ``tests/test_issue2841_show_cron_sessions_toggle.py`` reads that call site as
-    SOURCE TEXT (``'("cron", "webhook", "kanban") if source_filter is None'``),
-    so replacing the literal with ``BACKGROUND_CLI_SOURCES`` turned a
-    pre-existing test red. The literal is therefore kept, and this test pins it
-    to the constant the new code paths use so the two cannot drift apart.
+    SOURCE TEXT (``'("cron", "webhook", "kanban", "oneshot") if source_filter is None'``),
+    so replacing the literal with ``INTERACTIVE_WINDOW_EXCLUDED_CLI_SOURCES``
+    turned a pre-existing test red. The literal is therefore kept, and this test
+    pins it to the constant the new code paths use so the two cannot drift apart.
     """
     from pathlib import Path
 
     source = Path(models.__file__).read_text(encoding="utf-8")
-    literal = ", ".join(f'"{name}"' for name in models.BACKGROUND_CLI_SOURCES)
+    excluded = models.INTERACTIVE_WINDOW_EXCLUDED_CLI_SOURCES
+    literal = ", ".join(f'"{name}"' for name in excluded)
     assert f"exclude_sources=({literal}) if source_filter is None else None" in source, (
         "the interactive exclude_sources literal must list exactly "
-        f"BACKGROUND_CLI_SOURCES ({models.BACKGROUND_CLI_SOURCES!r})"
+        f"INTERACTIVE_WINDOW_EXCLUDED_CLI_SOURCES ({excluded!r})"
     )
-    assert '("cron", "webhook", "kanban") if source_filter is None' in source, (
+    assert '("cron", "webhook", "kanban", "oneshot") if source_filter is None' in source, (
         "test_issue2841_show_cron_sessions_toggle.py pins this exact substring"
     )
 
@@ -2485,3 +2706,119 @@ def test_sidebar_sidecar_keeps_its_existing_project_id_over_cli_metadata(monkeyp
 
     row = next(session for session in payload["sessions"] if session["session_id"] == "imported-cli")
     assert row["project_id"] == "sidecar-project"
+
+
+@pytest.mark.parametrize("quiet_count", [1, 3])
+def test_compression_heavy_widening_is_one_pass_budget_not_per_project(
+    fake_hermes_home, tmp_path, monkeypatch, quiet_count
+):
+    """The retry after a binding scoped window is paid from ONE pass budget.
+
+    ``remaining`` bounds each starved project's first scoped query, but the
+    widening that follows a binding raw window jumped straight to the global
+    ``query_limit`` — and it was granted to every starved project in turn. A
+    profile with ten compression-heavy projects therefore scanned ten times the
+    ceiling in a single build, growing with the number of starved projects
+    (greptile P1 on #6659). The widening now comes out of one pass-level pool
+    shared FAIRLY: each starved project's retry is funded by a slice of what
+    the pool still holds (one slice per project not yet tried), and the pool is
+    debited only for what a retry reads beyond the project's own width, so the
+    scoped reading of a build is bounded by ``3 * query_limit`` however many
+    projects are starved — while every starved project still pays its own first
+    query and still keeps pool for its own first retry, the completeness
+    guarantees neither a per-build project cap nor a first-come whole-grant
+    debit may break (both greptile P1 reviews on #6659).
+
+    Parametrized over the number of starved projects because that is exactly
+    what the budget must not scale with.
+    """
+    ceiling = 20
+    monkeypatch.setattr(models, "CLI_VISIBLE_SESSION_LIMIT", 5)
+    monkeypatch.setattr(models, "PROJECT_ASSIGNED_CLI_SCAN_CEILING", ceiling)
+    per_project_limit = 4
+    quiet = [f"project-quiet-{index}" for index in range(quiet_count)]
+    _register_projects(tmp_path, "project-busy", *quiet)
+
+    project_count = len(quiet) + 1
+    # The pass's own query budget: every project's equal share of the ceiling.
+    effective_limit = min(per_project_limit, max(1, ceiling // project_count))
+    query_limit = min(effective_limit * project_count, ceiling)
+
+    # Each quiet project's scoped raw window is consumed by its OWN compression
+    # segments, so its first scoped query comes back short with older assigned
+    # conversations of its own still waiting behind the window.
+    scoped_raw_window = per_project_limit * max(agent_sessions.CANDIDATE_WINDOW_MULTIPLIERS)
+    rows = []
+    for index, project_id in enumerate(quiet):
+        rows.append(_session(f"{project_id}-old", BASE_TS + index, project_id=project_id))
+        rows.extend(_lineage(
+            f"{project_id}-chain",
+            BASE_TS + 10_000 + index * 1_000,
+            scoped_raw_window + 100,
+            project_id=project_id,
+            step=1.0,
+        ))
+    rows.extend(
+        _session(f"busy-{index:03d}", BASE_TS + 5_000 + index, project_id="project-busy")
+        for index in range(25)
+    )
+    rows.extend(_session(f"plain-{index:02d}", BASE_TS + 90_000 + index) for index in range(25))
+    _write_state_db(fake_hermes_home / "state.db", rows)
+
+    scoped_queries = []
+    real_reader = models.read_importable_agent_session_rows
+
+    def _counting_reader(*args, **kwargs):
+        if kwargs.get("project_ids"):
+            scoped_queries.append((kwargs["project_ids"][0], kwargs.get("limit")))
+        return real_reader(*args, **kwargs)
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", _counting_reader)
+
+    sessions = models._load_cli_sessions_uncached(
+        fake_hermes_home,
+        fake_hermes_home / "state.db",
+        "default",
+        project_assigned_limit=per_project_limit,
+    )
+
+    # Completeness is untouched: EVERY starved project still gets its query.
+    # (The busy project is starved in this fixture too and is queried as well;
+    # what matters here is that no project of interest is skipped.)
+    tried = {project_id for project_id, _ in scoped_queries}
+    assert set(quiet) <= tried
+
+    # A widened query is one that asks for more than the project's own share.
+    widened = [limit for _, limit in scoped_queries if limit > effective_limit]
+    # The pool is shared fairly: EVERY starved project gets a widening retry —
+    # not just the first in line, and not zero of them. With one starved
+    # project the pool is entirely its own; with several, each retry is funded
+    # by a slice of what remains so later projects keep pool for theirs.
+    # Bounded by the number of retrying projects, not by the pool arithmetic
+    # (a single starved project legitimately spends the whole pool on one
+    # retry to `query_limit`).
+    assert len(widened) == min(quiet_count, len(quiet))
+    # Every retry covers the whole project: the reader's own 32x oversample
+    # turns a query at `limit` into a raw read of at most
+    # `limit * max(CANDIDATE_WINDOW_MULTIPLIERS)` rows, so the retry grants
+    # stay under `query_limit * 32` — but the retries must never buy the
+    # unbounded per-project read the original P1 described.
+    assert all(
+        limit <= query_limit * max(agent_sessions.CANDIDATE_WINDOW_MULTIPLIERS)
+        for limit in widened
+    )
+    # The retries are PAID FROM THE POOL, not granted per project: the sum of
+    # what they read beyond their projects' own widths stays within the pool
+    # plus each project's one honest re-read of its own width — the aggregate
+    # bound that keeps the pass constant in the number of starved projects.
+    assert sum(widened) <= len(widened) * query_limit
+    # And the whole pass stays inside the documented aggregate bound,
+    # whatever the number of starved projects.
+    assert sum(limit for _, limit in scoped_queries) <= 3 * query_limit
+
+    # The widening the budget funded still recovers the conversation behind
+    # EVERY starved project's window — the retry was rationed, not disabled.
+    for project_id in quiet:
+        assert f"{project_id}-old" in {
+            session["session_id"] for session in sessions
+        }, f"the funded widening must still reach behind {project_id}'s window"

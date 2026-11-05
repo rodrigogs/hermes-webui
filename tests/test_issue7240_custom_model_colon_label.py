@@ -41,6 +41,9 @@ const fnSrc = ui.slice(start, after);
 // Optional pre-hydrated catalog: {routingId: label}. Absent -> empty, which
 // exercises the string-only legacy fallback.
 const _dynamicModelLabels = process.argv[3] ? JSON.parse(process.argv[3]) : {};
+// The real catalog also declares the named provider IDs. The fork uses
+// this metadata to distinguish numeric model names from host:port slugs.
+const _dynamicProviderIds = {'custom:omni': true, 'custom:ai_gateway': true};
 function _fmtOllamaLabel(s){ return s; }
 // getModelLabel() calls the dotted Bedrock/Vertex prefix normalizer, which lives
 // just above it with two Sets it closes over. Pull all three in, or the eval'd

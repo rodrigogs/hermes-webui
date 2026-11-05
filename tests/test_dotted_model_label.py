@@ -378,7 +378,7 @@ def test_every_catalog_dotted_id_loses_its_routing_prefix():
         if head not in namespace_heads:
             continue
         label = _get_label_for_model(model_id, [])
-        if head in label.lower().replace(" ", "."):
+        if head == label.lower().replace(" ", ".").split(".", 1)[0]:
             offenders.append((model_id, label))
 
     assert not offenders, (

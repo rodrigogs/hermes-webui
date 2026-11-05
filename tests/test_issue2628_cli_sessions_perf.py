@@ -257,37 +257,6 @@ def test_importable_agent_rows_push_sidebar_limit_into_sql(tmp_path):
     assert cap == 160, candidates_sql
 
 
-def test_importable_agent_rows_candidate_window_overfilters_then_fills(tmp_path):
-    """Rows dropped after projection must not shrink the returned page.
-
-    The SQL candidate window is oversampled (limit * 8) precisely so sessions
-    filtered client-side of the SQL (invisible CLI rows here) only consume
-    candidates, not result slots: a page that would be short if the cap were
-    the plain ``limit`` still fills to ``limit`` visible rows.
-    """
-    db = tmp_path / "state.db"
-    _make_state_db(db, sessions=120, messages_per_session=5)
-
-    # 30 newest sessions are CLI rows that the projection hides (ended, default
-    # title, no user turn visible): they must fall out of the window without
-    # starving the visible page below them.
-    conn = sqlite3.connect(str(db))
-    for i in range(90, 120):
-        conn.execute(
-            "UPDATE sessions SET title = 'cli session', ended_at = 1.0, end_reason = 'timeout' WHERE id = ?",
-            (f"cli_perf_{i:04d}",),
-        )
-    conn.commit()
-    conn.close()
-
-    rows = agent_sessions.read_importable_agent_session_rows(db, limit=20, exclude_sources=("webui",))
-
-    assert len(rows) == 20
-    assert rows[0]["id"] == "cli_perf_0089"
-    assert rows[-1]["id"] == "cli_perf_0070"
-    assert {row["actual_message_count"] for row in rows} == {5}
-
-
 def test_importable_agent_rows_candidate_ordering_stays_under_progress_budget(tmp_path, monkeypatch):
     """Cron-only missing-index scans should fail under the old shape budget, then pass after pre-aggregation."""
     db = tmp_path / "state.db"

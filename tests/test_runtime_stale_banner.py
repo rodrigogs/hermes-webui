@@ -92,10 +92,12 @@ def test_failed_send_persists_the_draft_for_the_restart():
 
 
 def test_backend_producers_speak_the_detector_vocabulary():
-    # Every producer must use `type` or `error_type` — if a third shape
-    # appears, the detector (and this test) must grow with it.
-    assert '"type": "agent_runtime_stale"' in ROUTES_PY
-    assert '"error_type": "agent_runtime_stale"' in ROUTES_PY
-    # Barrier (:21502) + four hand-built sites (:23529, :24869, :25241,
-    # :25906) + the worker job payload (:24812).
-    assert ROUTES_PY.count("agent_runtime_stale") >= 6
+    # Upstream consolidated HTTP and worker producers behind one payload helper.
+    # Exercise that helper through the route's actual import binding.
+    from api import routes
+    from api.agent_runtime import AgentRuntimeChangedError
+
+    payload = routes.agent_runtime_stale_payload(AgentRuntimeChangedError("updated"))
+    assert payload["type"] == "agent_runtime_stale"
+    assert payload["retryable"] is True
+    assert payload["restart_scheduled"] is False
