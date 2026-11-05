@@ -11986,18 +11986,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             }
                         )
 
-                # Config label map: honor operator-supplied labels
-                # (custom_providers[].models[].label) instead of title-casing
-                # the raw id, which mangles namespaced Bedrock ids like
-                # "us.anthropic.claude-opus-4-8" -> "Us.anthropic.claude Opus 4 8"
-                # (and ".../-v1:0" -> "0"). Mirrors the cold-path fix at ~5304.
-                _cp_label_map: dict = {}
-                for _opt in _configured_model_options(_cp.get("models")):
-                    _oid = str(_opt.get("id") or "").strip()
-                    _olabel = str(_opt.get("label") or "").strip()
-                    if _oid and _olabel:
-                        _cp_label_map[_oid] = _olabel
-
                 # Collect configured model IDs as a fallback/sticky entry after live discovery.
                 _cp_model_ids: list[str] = []
                 _cp_model = _cp.get("model", "")

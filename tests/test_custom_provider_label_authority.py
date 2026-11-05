@@ -253,6 +253,22 @@ def test_prewarmed_row_labeled_dict_then_bare_keeps_first_label(live_endpoint, _
     )
 
 
+def test_hot_configured_fallback_derives_bare_model_label(live_endpoint, _sync_rebuild):
+    """A hot rebuild with an empty endpoint result must retain the same derived
+    label as the cold catalog for a bare configured model, not synthesize the
+    raw id as an operator label."""
+    model_id = "us.anthropic.claude-opus-4-8"
+    _ModelsEndpoint.payload = {"data": []}
+    result = _models_with_cfg(
+        model_cfg=_active_cfg(live_endpoint),
+        custom_providers=[{**_gateway_cfg(live_endpoint), "models": [model_id]}],
+    )
+    row = _row_by_model_id(result.get("groups", []), "custom:mygateway", model_id)
+    assert row is not None
+    assert row["label"] == config._get_label_for_model(model_id, [])
+    assert row["label"] != model_id
+
+
 # ── Cold path: network-free catalog ──────────────────────────────────────────
 
 def test_cold_catalog_takes_configured_label():
